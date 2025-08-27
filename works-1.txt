@@ -1,0 +1,348 @@
+app.py
+
+import re
+import httpx
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from openai import OpenAI
+from duckduckgo_search import DDGS
+from datetime import datetime
+from typing import AsyncGenerator
+import wikipediaapi
+import sqlite3
+import os
+
+
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+
+#--------------------------------------
+# CORS Middleware(frontend)
+#--------------------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow your frontend origin
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all methods (GET, POST, OPTIONS, etc.)
+    allow_headers=["*"],  # Allow all headers
+)
+# -----------------------------------------
+# Database Setup
+# -----------------------------------------
+DB_PATH = "data.db"
+
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS conversations (
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+
+init_db()
+
+def load_conversation(session_id: str) -> list[dict]:
+    """Load conversation history from database."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT role, content FROM conversations
+            WHERE session_id = ?
+            ORDER BY timestamp
+        """, (session_id,))
+        return [{"role": row["role"], "content": row["content"]} for row in cursor.fetchall()]
+
+def save_message(session_id: str, role: str, content: str):
+    """Save a message to the database."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO conversations (session_id, role, content) VALUES (?, ?, ?)",
+            (session_id, role, content)
+        )
+        conn.commit()
+
+# -----------------------------------------
+# Models
+# -----------------------------------------
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=1000)
+    session_id: str = Field(default=None)
+
+# -----------------------------------------
+# OpenAI Client to Local LLM
+# -----------------------------------------
+client = OpenAI(
+    base_url="http://model-runner.docker.internal/engines/llama.cpp/v1",
+    api_key="not-needed"
+)
+
+# -----------------------------------------
+# Wikipedia API Client
+# -----------------------------------------
+wiki = wikipediaapi.Wikipedia(
+    language='en',
+    extract_format=wikipediaapi.ExtractFormat.WIKI,
+    user_agent="NOVA/1.0 (jayanthkopparthi595@gmail.com)"
+)
+
+# -----------------------------------------
+# Assistant Persona
+# -----------------------------------------
+# === Role-Specific System Prompts ===
+
+CHAT_SYSTEM_PROMPT = """You are NOVA, a friendly personal assistant.
+- Respond concisely and in a simple and straightforward language but more informatively.
+- If the user asks basic information questions, provide clear and straightforward answers.
+- If the user asks for help with tasks, provide step-by-step guidance.
+- Ask clarifying questions if needed.
+- Always stay up-to-date with {current_time}.
+- Avoid markdown. Use plain text with light emoji where appropriate.
+- If URLs appear in your response, mention them clearly and ensure they're valid.
+- Never invent facts. If unsure, say so.
+"""
+
+WEB_SEARCH_SYSTEM_PROMPT = """You are NOVA, an expert research assistant.
+- Your job is to summarize and synthesize information from multiple sources (web, Wikipedia).
+- Prioritize accuracy, credibility, and clarity.
+- Clearly attribute information to its source (e.g., "According to Wikipedia..." or "A web result states...").
+- Combine insights into a coherent, concise summary.
+- Highlight key facts, dates, definitions, or controversies if relevant.
+- Include only the most relevant links and verify they are accessible.
+- Always be up-to-date with {current_time}.
+- If no reliable information is found, say so honestly.
+- Never hallucinate or fabricate sources.
+"""
+
+# -----------------------------------------
+# URL Regex & Checker
+# -----------------------------------------
+url_pattern = re.compile(r'https?://[\w\-./?=&%]+', re.IGNORECASE)
+
+async def check_url(url: str) -> str:
+    """Check if a URL is accessible."""
+    if url.lower().startswith("javascript:"):
+        return f"{url}  (unsafe)"
+    try:
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
+            r = await client.get(url, headers={"User-Agent": "NOVA/1.0"})
+            return f"{url} (accessible)" if r.status_code == 200 else f"{url}  (status {r.status_code})"
+    except Exception as e:
+        return f"{url} ({e.__class__.__name__})"
+
+# -----------------------------------------
+# Chat Endpoint with Memory
+# -----------------------------------------
+@app.post("/chat")
+async def chat_stream(request: ChatRequest) -> StreamingResponse:
+    """Stream NOVA chat responses with memory using session_id."""
+    current_time = datetime.now().strftime("%B %d, %Y, %I:%M %p %Z")
+    session_id = request.session_id or f"sess_{int(datetime.now().timestamp())}_{os.urandom(4).hex()}"
+
+    history = load_conversation(session_id)
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        try:
+            buffer = ""
+            messages = [
+                {"role": "system", "content": CHAT_SYSTEM_PROMPT.format(current_time=current_time)}
+            ] + history + [
+                {"role": "user", "content": request.message}
+            ]
+
+            stream = client.chat.completions.create(
+                model="ai/gemma3",
+                messages=messages,
+                stream=True,
+            )
+
+            assistant_response = ""
+            for chunk in stream:
+                content = chunk.choices[0].delta.content
+                if content:
+                    buffer += content
+                    assistant_response += content
+                    yield f"data: {content}\n\n"
+
+            # Check for URLs
+            urls = url_pattern.findall(buffer)
+            if urls:
+                yield f"data: \n\n🔗 Links found:\n"
+                for url in urls:
+                    yield f"data: {await check_url(url)}\n\n"
+
+            # Save to DB
+            save_message(session_id, "user", request.message)
+            save_message(session_id, "assistant", assistant_response)
+
+            yield f"data: \n\n✅ Continue this chat with session ID: `{session_id}`\n\n"
+
+        except Exception as e:
+            error_msg = f"Error: {str(e)}"
+            yield f"data: {error_msg}\n\n"
+            save_message(session_id, "assistant", f"[System error: {str(e)}]")
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+# -----------------------------------------
+# Web Search with Memory
+# -----------------------------------------
+@app.post("/web_search")
+async def web_search(request: ChatRequest) -> StreamingResponse:
+    """Stream web search results summarized by NOVA from DuckDuckGo and Wikipedia."""
+    current_time = datetime.now().strftime("%B %d, %Y, %I:%M %p %Z")
+    query = request.message
+    session_id = request.session_id or f"sess_{int(datetime.now().timestamp())}_{os.urandom(4).hex()}"
+
+    history = load_conversation(session_id)
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        try:
+            # Build context with real sources
+            summary_prompt = WEB_SEARCH_SYSTEM_PROMPT.format(current_time=current_time) + "\n\nAnalyze and summarize the following sources:\n\n"
+            all_urls = []
+
+            # 1. DuckDuckGo Search
+            try:
+                dd_results = DDGS().text(query, max_results=5)
+                if dd_results:
+                    summary_prompt += "=== Web Results (DuckDuckGo) ===\n"
+                    for i, r in enumerate(dd_results, 1):
+                        summary_prompt += f"{i}. [{r['title']}]({r['href']})\n   {r['body']}\n\n"
+                        all_urls.append(r['href'])
+            except Exception as e:
+                summary_prompt += f"⚠️ Could not fetch web results: {str(e)}\n\n"
+
+            # 2. Wikipedia Search
+            try:
+                wiki_page = wiki.page(query)
+                if wiki_page.exists():
+                    summary_prompt += f"=== Wikipedia Entry: {wiki_page.title} ===\n{wiki_page.summary[:1200]}{'...' if len(wiki_page.summary) > 1200 else ''}\n\n"
+                    all_urls.append(wiki_page.fullurl)
+                else:
+                    summary_prompt += f"⚠️ No Wikipedia page found for '{query}'.\n\n"
+            except Exception as e:
+                summary_prompt += f"⚠️ Error fetching Wikipedia: {str(e)}\n\n"
+
+            # If no data
+            if "⚠️ Could not fetch" in summary_prompt and "=== Wikipedia Entry" not in summary_prompt:
+                response = f"❌ No reliable information found for *{query}* as of {current_time}. Try a different phrasing."
+                yield f"data: {response}\n\n"
+                save_message(session_id, "user", query)
+                save_message(session_id, "assistant", response)
+                yield f"data: \n\n📌 Tip: Be specific and use full terms (e.g., 'climate change effects on oceans').\n"
+                yield f"data: ✅ Use session ID: `{session_id}` to continue.\n\n"
+                return
+
+            # Stream LLM-generated summary
+            context_messages = [
+                {"role": "system", "content": summary_prompt},
+                {"role": "user", "content": f"Summarize the key facts about: {query}"}
+            ] + history[-4:]  # Add limited past context
+
+            stream = client.chat.completions.create(
+                model="ai/gemma3",
+                messages=context_messages,
+                stream=True
+            )
+
+            assistant_response = ""
+            for chunk in stream:
+                content = chunk.choices[0].delta.content
+                if content:
+                    assistant_response += content
+                    yield f"data: {content}\n\n"
+
+            # Append verified links
+            if all_urls:
+                yield f"data: \n\n🔗 Verified Sources:\n"
+                for url in all_urls:
+                    yield f"data: {await check_url(url)}\n\n"
+
+            yield f"data: \n\n💡 You can ask follow-up questions to go deeper!\n"
+            yield f"data: ✅ Continue with session ID: `{session_id}`\n\n"
+
+            # Save interaction
+            save_message(session_id, "user", query)
+            save_message(session_id, "assistant", assistant_response)
+
+        except Exception as e:
+            error_msg = f"Search failed: {str(e)}"
+            yield f"data: {error_msg}\n\n"
+            save_message(session_id, "user", query)
+            save_message(session_id, "assistant", f"[Error: {str(e)}]")
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+# -----------------------------------------
+# Session Management Endpoints
+# -----------------------------------------
+@app.get("/sessions")
+async def list_sessions():
+    """List all session IDs."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT session_id FROM conversations ORDER BY timestamp")
+        sessions = [row["session_id"] for row in cur.fetchall()]
+    return {"sessions": sessions}
+
+@app.get("/sessions/{session_id}")
+async def get_session(session_id: str):
+    """Get full conversation by session_id."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT role, content, timestamp FROM conversations WHERE session_id = ? ORDER BY timestamp",
+            (session_id,)
+        )
+        rows = cur.fetchall()
+        if not rows:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return {
+            "session_id": session_id,
+            "messages": [{"role": r["role"], "content": r["content"], "time": r["timestamp"]} for r in rows]
+        }
+
+# -----------------------------------------
+# Optional: Health Check
+# -----------------------------------------
+@app.get("/")
+async def root():
+    return {"message": "NOVA Assistant is running", "endpoints": ["/chat", "/web_search", "/sessions"]}
+
+
+
+docker-compose.yaml
+services:
+  ai-app:
+    build: .
+    container_name: nova-ai
+    ports:
+      - "8000:8000"
+    depends_on:
+      - llm
+
+  llm:
+    image: cloud_app-ai-app:latest  
+    container_name: nova-llm
+    environment:
+      MODEL: ai/gemma3
+    ports:
+      - "8080:8080"
+
+Dockerfile
+FROM python:3.9-slim
+
+RUN pip install duckduckgo_search httpx fastapi uvicorn openai wikipedia-api
+
+COPY . .
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]

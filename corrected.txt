@@ -1,0 +1,853 @@
+output
+
+Hello there ! 😊
+
+
+It ’s wonderful to connect with you .
+
+
+I ’m NOVA , your personal assistant . I ’m here to help you with whatever you need – from answering questions to organizing your thoughts .
+
+
+📍
+
+
+Let’s Get Started
+
+
+• How can I assist you today ?
+
+
+① Do you have a specific question you ’d like me to answer ?
+
+
+② Would you like me to help you with a task , like setting a reminder or drafting an email ?
+
+
+I 'm designed to be clear , concise , and – most importantly – helpful .
+
+
+💬 " 𝐴 𝐻𝐸𝐿𝑃𝐹𝑈𝐿 𝐴𝑆𝑆𝐼𝑆𝑇𝐴𝑁𝑇 𝐼𝑆 𝐿𝐼𝐾𝐸 𝐴 𝑄𝑈𝐼𝐸𝑇 𝐹𝑅𝐼𝐸𝑁𝐷 , 𝐴𝐿𝑊𝐴𝑌𝑆 𝑇𝐻𝐸𝑅𝐸 𝑊𝐻𝐸𝑁 𝑌𝑂𝑈 𝑁𝐸𝐸𝐷 𝑇𝐻𝐸𝑀 ."
+
+
+─ ─
+
+
+It’s August 2 3, 2 025, 0 7: 04 PM . How can I be of service ?
+
+
+
+
+import re
+import httpx
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from openai import OpenAI
+from duckduckgo_search import DDGS
+from datetime import datetime
+from typing import AsyncGenerator
+import wikipediaapi
+import sqlite3
+import os
+from fastapi.middleware.cors import CORSMiddleware
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+# CORS Middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Database Setup
+DB_PATH = "data.db"
+
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS conversations (
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+
+init_db()
+
+def load_conversation(session_id: str) -> list[dict]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT role, content FROM conversations
+            WHERE session_id = ?
+            ORDER BY timestamp
+        """, (session_id,))
+        return [{"role": row["role"], "content": row["content"]} for row in cursor.fetchall()]
+
+def save_message(session_id: str, role: str, content: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO conversations (session_id, role, content) VALUES (?, ?, ?)",
+            (session_id, role, content)
+        )
+        conn.commit()
+
+# Models
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=1000)
+    session_id: str = None
+
+# OpenAI Client to Local LLM
+client = OpenAI(
+    base_url="http://model-runner.docker.internal/engines/llama.cpp/v1",
+    api_key="not-needed"
+)
+
+# Wikipedia API Client
+wiki = wikipediaapi.Wikipedia(
+    language='en',
+    extract_format=wikipediaapi.ExtractFormat.WIKI,
+    user_agent="NOVA/1.0 (jayanthkopparthi595@gmail.com)"
+)
+
+# Unicode maps for text styling
+normal_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 '"
+bold_chars = '𝗔𝗕𝗖𝗗𝗘𝗙𝗚𝗛𝗜𝗝𝗞𝗟𝗠𝗡𝗢𝗣𝗤𝗥𝗦𝗧𝗨𝗩𝗪𝗫𝗬�_Z𝗮𝗯𝗰𝗱𝗲𝗳𝗴𝗵𝗶𝗷𝗸𝗹𝗺𝗻𝗼𝗽𝗾𝗿𝘀𝘁𝘂𝘃𝘄𝘅𝘆𝘇𝟬𝟭𝟮𝟯𝟰𝟱𝟲𝟳𝟴𝟵 𝗮𝗽𝗼𝘀𝘁𝗿𝗼𝗽𝗵𝗲'
+italic_chars = '𝘈𝘉𝘊𝘋𝘌𝘍𝘎𝘏𝘐𝘑𝘒𝘓𝘔𝘕𝘖𝘗𝘘𝘙𝘚𝘛𝘜𝘝𝘞𝘟𝘠𝘡𝘢𝘣𝘤𝘥𝘦𝘧𝘨𝘩𝘪𝘫𝘬𝘭𝘮𝘯𝘰𝘱𝘲𝘳𝘴𝘵𝘶𝘷𝘸𝘹𝘺𝘻𝟬𝟭𝟮𝟯𝟰𝟱𝟲𝟳𝟴𝟵 𝘢𝘱𝘰𝘴𝘵𝘳𝘰𝘱𝘩𝘦'
+bold_italic_chars = '𝙰𝙱𝙲𝙳𝙴𝙵𝙶𝙷𝙸𝙹𝙺𝙻𝙼𝙽𝙾𝙿𝚀𝚁𝚂𝚃𝚄𝚅𝚆𝚇𝚈𝚉𝙖𝙗𝙘𝙙𝙚𝙛𝙜𝙝𝙞𝙟𝙠𝙡𝙢𝙣𝙤𝙥𝙖𝙧𝙨𝙩𝙪𝙫𝙬𝙭𝙮𝙯𝟬𝟭𝟮𝟯𝟰𝟱𝟔𝟕𝟖𝟗 𝙖𝙥𝙤𝙨𝙩𝙧𝙤𝙥𝙝𝙚'
+mono_chars = '𝚊𝚋𝚌𝚍𝚎𝚏𝚐𝚑𝚒𝚓𝚔𝚕𝚖𝚗𝚘𝚙𝚚𝚛𝚜𝚝𝚞𝚟𝚠𝚡𝚢𝚣𝙰𝙱𝙲𝙳𝙴𝙵𝙶𝙷𝙸𝙹𝙺𝙻𝙼𝙽𝙾𝙿𝚀𝚁𝚂𝚃𝚄𝚅𝚆𝚇𝚈𝚉𝟶𝟷𝟸𝟹𝟺𝟻𝟼𝟽𝟾𝟿 𝚊𝚙𝚘𝚜𝚝𝚛𝚼𝚙𝚑𝚎'
+
+bold_map = {normal_chars[i]: bold_chars[i] for i in range(len(normal_chars))}
+italic_map = {normal_chars[i]: italic_chars[i] for i in range(len(normal_chars))}
+bold_italic_map = {normal_chars[i]: bold_italic_chars[i] for i in range(len(normal_chars))}
+mono_map = {normal_chars[i]: mono_chars[i] for i in range(len(normal_chars))}
+
+def to_unicode(text: str, style: str) -> str:
+    style_map = {
+        'bold': bold_map,
+        'italic': italic_map,
+        'bold_italic': bold_italic_map,
+        'mono': mono_map
+    }.get(style, {})
+    return ''.join(style_map.get(c, c) for c in text)
+
+circled_numbers = ['', '①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨', '⑩', '⑪', '⑫', '⑬', '⑭', '⑮', '⑯', '⑰', '⑱', '⑲', '⑳']
+
+def preprocess_text(text: str) -> str:
+    if not text:
+        return ""
+
+    cleaned = text
+    # Remove logging prefixes
+    cleaned = re.sub(r'^nova-ai\s*\|\s*INFO:app:\s*', '', cleaned, flags=re.MULTILINE)
+    # Remove stray control characters and normalize line endings
+    cleaned = cleaned.replace('\r\n', '\n').replace('\r', '\n')
+    # Collapse multiple newlines
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    # Join lines that are part of the same paragraph (not lists or headings)
+    cleaned = re.sub(r'([^\n])\n(?!\n|[•①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳❝📌📍▸→`])', r'\1 ', cleaned)
+    # Remove extra spaces before colons
+    cleaned = re.sub(r'\s+:', ':', cleaned)
+    # Collapse multiple spaces
+    cleaned = re.sub(r' {2,}', ' ', cleaned)
+    # Trim whitespace
+    cleaned = cleaned.strip()
+
+    # Replace markdown styles with Unicode
+    cleaned = re.sub(r'\*\*\*(.*?)\*\*\*', lambda m: to_unicode(m.group(1), 'bold_italic'), cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r'\*\*(.*?)\*\*', lambda m: to_unicode(m.group(1), 'bold'), cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r'\*(.*?)\*', lambda m: to_unicode(m.group(1), 'italic'), cleaned, flags=re.DOTALL)
+    
+    # Inline code
+    cleaned = re.sub(r'`([^`]+)`', r'💻 \1', cleaned)
+    
+    # Block code
+    cleaned = re.sub(r'```(\w*)\n([\s\S]*?)```', lambda m: f'\n💻 Code ({m.group(1) or "text"}):\n{to_unicode(m.group(2), "mono")}\n\n', cleaned, flags=re.DOTALL)
+    
+    # Links
+    cleaned = re.sub(r'\[(.*?)\]\((.*?)\)', r'\1 🔗 \2', cleaned)
+    
+    # Headings
+    cleaned = re.sub(r'^# (.*)$', r'📌 \1\n', cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r'^## (.*)$', r'📍 \1\n', cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r'^### (.*)$', r'▸ \1\n', cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r'^#### (.*)$', r'→ \1\n', cleaned, flags=re.MULTILINE)
+    
+    # Lists
+    cleaned = re.sub(r'^(\s*)\* (.*)$', r'\1🔹 \2\n', cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r'^(\s*)- (.*)$', r'\1• \2\n', cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r'^(\s*)(\d+)\. (.*)$', lambda m: f'{m.group(1)}{circled_numbers[int(m.group(2))] if int(m.group(2)) < len(circled_numbers) else m.group(2) + "."} {m.group(3)}\n', cleaned, flags=re.MULTILINE)
+    
+    # Blockquote
+    cleaned = re.sub(r'^> (.*)$', r'❝ \1\n', cleaned, flags=re.MULTILINE)
+    
+    # Horizontal rule
+    cleaned = re.sub(r'^---$', '───\n', cleaned, flags=re.MULTILINE)
+
+    return cleaned
+
+# Assistant Persona
+CHAT_SYSTEM_PROMPT = """You are NOVA, a highly accurate, empathetic, and user-friendly personal assistant. Provide clear, concise, and readable responses using plain text with Unicode symbols for emphasis and structure. Use • for bullet points, ①②③ for numbered lists, 📌 for main sections, 📍 for subsections, ▸ for sub-subsections, → for minor sections, ❝ for quotes, and ─── for separators. Use Unicode bold (𝗯𝗼𝗹𝗱), italic (𝘪𝘵𝘢𝘭𝘪𝘤), bold-italic (𝙗𝙤𝙡𝙙-𝙞𝙩𝙖𝙡𝙞𝙘), and monospace (𝚖𝚘𝚗𝚘𝚜𝚙𝚊𝚌𝚎) for emphasis instead of markdown. Ensure proper spacing and line breaks for readability. Current time: {current_time}."""
+
+WEB_SEARCH_SYSTEM_PROMPT = """You are NOVA, an expert research assistant focused on delivering accurate and reliable information. Current time: {current_time}.
+- Summarize information from provided sources (e.g., web results, Wikipedia) into a concise, coherent response.
+- Prioritize credible sources, citing them clearly (e.g., Wikipedia states..., A web source from [site] reports...).
+- Include key facts, dates, definitions, or notable controversies, avoiding unnecessary details.
+- If sources conflict, highlight discrepancies and provide a balanced summary.
+- Verify all URLs for accessibility and relevance before including them.
+- If no reliable sources are found, state this clearly and suggest alternative ways to find information.
+- Structure responses with clear sections using 📌 for main sections, 📍 for subsections, ▸ for sub-subsections, → for minor sections.
+- Use • for bullet points and ①②③ for numbered lists.
+- Use ❝ for quotes and ─── for separators.
+- Use Unicode bold (𝗯𝗼𝗹𝗱), italic (𝘪𝘵𝘢𝘭𝘪𝘤), bold-italic (𝙗𝙤𝙡𝙙-𝙞𝙩𝙖𝙡𝙞𝙘), and monospace (𝚖𝚘𝚗𝚘𝚜𝚙𝚊𝚌𝚎) for emphasis instead of markdown.
+- Ensure proper spacing and line breaks for readability.
+- Avoid markdown symbols (*, **, ***, #, etc.).
+- Never invent facts, sources, or details. If data is incomplete, acknowledge it."""
+
+# URL Regex & Checker
+url_pattern = re.compile(r'https?://[\w\-./?=&%]+', re.IGNORECASE)
+
+async def check_url(url: str) -> str:
+    if url.lower().startswith("javascript:"):
+        return f"{url} (unsafe)"
+    try:
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
+            r = await client.get(url, headers={"User-Agent": "NOVA/1.0"})
+            return f"{url} (accessible)" if r.status_code == 200 else f"{url} (status {r.status_code})"
+    except Exception as e:
+        return f"{url} ({e.__class__.__name__})"
+
+# Chat Endpoint with Memory
+@app.post("/chat")
+async def chat_stream(request: ChatRequest) -> StreamingResponse:
+    current_time = datetime.now().strftime("%B %d, %Y, %I:%M %p %Z")
+    session_id = request.session_id or f"sess_{int(datetime.now().timestamp())}_{os.urandom(4).hex()}"
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        try:
+            accumulated_response = ""
+            token_count = 0
+
+            messages = [
+                {"role": "system", "content": CHAT_SYSTEM_PROMPT.format(current_time=current_time)}
+            ] + load_conversation(session_id) + [
+                {"role": "user", "content": request.message}
+            ]
+
+            stream = client.chat.completions.create(
+                model="ai/gemma3",
+                messages=messages,
+                stream=True,
+                temperature=0.7,
+                max_tokens=2048
+            )
+
+            word_buffer = ""
+
+            for chunk in stream:
+                if chunk.choices[0].delta.content:
+                    content = chunk.choices[0].delta.content
+                    accumulated_response += content
+                    token_count += 1
+
+                    logger.debug(f"[Token {token_count}] {content.strip()}")
+
+                    word_buffer += content
+                    if any(char in word_buffer for char in [' ', '\n', '.', '!', '?', ';', ':', ',']) and word_buffer.strip():
+                        if '\n' in word_buffer:
+                            parts = word_buffer.split('\n')
+                            for i, part in enumerate(parts):
+                                part_stripped = part.strip()
+                                if part_stripped:
+                                    processed = preprocess_text(part_stripped)  # Preprocess each chunk
+                                    print(f"STREAM >> {repr(processed)}")
+                                    yield f"data: {processed}\n\n"
+                                if i < len(parts) - 1:
+                                    print(f"STREAM >> {repr('')}")
+                                    yield "data: \n\n"
+                        else:
+                            processed = preprocess_text(word_buffer)  # Preprocess each chunk
+                            print(f"STREAM >> {repr(processed)}")
+                            yield f"data: {processed}\n\n"
+                        word_buffer = ""
+
+            if word_buffer.strip():
+                if '\n' in word_buffer:
+                    parts = word_buffer.split('\n')
+                    for i, part in enumerate(parts):
+                        part_stripped = part.strip()
+                        if part_stripped:
+                            processed = preprocess_text(part_stripped)
+                            print(f"STREAM >> {repr(processed)}")
+                            yield f"data: {processed}\n\n"
+                        if i < len(parts) - 1:
+                            print(f"STREAM >> {repr('')}")
+                            yield "data: \n\n"
+                else:
+                    processed = preprocess_text(word_buffer)
+                    print(f"STREAM >> {repr(processed)}")
+                    yield f"data: {processed}\n\n"
+
+            logger.info(f"====== FINAL CHAT RESPONSE (session: {session_id}) START ======")
+            logger.info(accumulated_response)
+            logger.info(f"====== FINAL CHAT RESPONSE (session: {session_id}) END ======")
+            logger.info(f"Total tokens streamed: {token_count}")
+
+            urls = url_pattern.findall(accumulated_response)
+            if urls:
+                yield "data: \n\n"
+                yield "data: 🔗 Links found:\n\n"
+                for url in urls:
+                    yield f"data: {await check_url(url)}\n\n"
+
+            save_message(session_id, "user", request.message)
+            save_message(session_id, "assistant", preprocess_text(accumulated_response))
+
+            yield "data: \n\n"
+            yield f"data: ✅ Continue this chat with session ID: {session_id}\n\n"
+
+        except Exception as e:
+            error_msg = f"Error: {str(e)}"
+            logger.error(f"Stream error: {error_msg}")
+            yield f"data: {error_msg}\n\n"
+            save_message(session_id, "assistant", f"[System error: {str(e)}]")
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+# Web Search Endpoint (unchanged for brevity, apply similar preprocessing to chunks if needed)
+@app.post("/web_search")
+async def web_search(request: ChatRequest) -> StreamingResponse:
+    current_time = datetime.now().strftime("%B %d, %Y, %I:%M %p %Z")
+    query = request.message
+    session_id = request.session_id or f"sess_{int(datetime.now().timestamp())}_{os.urandom(4).hex()}"
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        try:
+            summary_prompt = WEB_SEARCH_SYSTEM_PROMPT.format(current_time=current_time) + "\n\nAnalyze and summarize the following sources:\n\n"
+            all_urls = []
+
+            try:
+                dd_results = DDGS().text(query, max_results=5)
+                if dd_results:
+                    summary_prompt += "Web Results (DuckDuckGo):\n"
+                    for i, r in enumerate(dd_results, 1):
+                        summary_prompt += f"{circled_numbers[i]} {r['title']} ({r['href']}):\n{r['body']}\n\n"
+                        all_urls.append(r['href'])
+            except Exception as e:
+                summary_prompt += f"⚠️ Could not fetch web results: {str(e)}\n\n"
+
+            try:
+                wiki_page = wiki.page(query)
+                if wiki_page.exists():
+                    summary_prompt += f"Wikipedia Entry: {wiki_page.title}:\n{wiki_page.summary[:1200]}{'...' if len(wiki_page.summary) > 1200 else ''}\n\n"
+                    all_urls.append(wiki_page.fullurl)
+                else:
+                    summary_prompt += f"⚠️ No Wikipedia page found for '{query}'.\n\n"
+            except Exception as e:
+                summary_prompt += f"⚠️ Error fetching Wikipedia: {str(e)}\n\n"
+
+            if "⚠️ Could not fetch" in summary_prompt and "Wikipedia Entry" not in summary_prompt:
+                response = f"⚡ No reliable information found for {query} as of {current_time}. Try a different phrasing."
+                yield f"data: {response}\n\n"
+                save_message(session_id, "user", query)
+                save_message(session_id, "assistant", response)
+                yield "data: \n\n"
+                yield "data: 📌 Tip: Be specific and use full terms (e.g., climate change effects on oceans).\n\n"
+                yield f"data: ✅ Use session ID: {session_id} to continue.\n\n"
+                logger.info(f"Final web search response for session {session_id} (NO SOURCES):\n{response}")
+                return
+
+            context_messages = [
+                {"role": "system", "content": summary_prompt},
+                {"role": "user", "content": f"Summarize the key facts about: {query}"}
+            ] + load_conversation(session_id)[-4:]
+
+            stream = client.chat.completions.create(
+                model="ai/gemma3",
+                messages=context_messages,
+                stream=True,
+                temperature=0.7,
+                max_tokens=2048
+            )
+
+            accumulated_response = ""
+            token_count = 0
+            word_buffer = ""
+
+            for chunk in stream:
+                if chunk.choices[0].delta.content:
+                    content = chunk.choices[0].delta.content
+                    accumulated_response += content
+                    token_count += 1
+                    logger.debug(f"[Token {token_count}] {content.strip()}")
+
+                    word_buffer += content
+                    if any(char in word_buffer for char in [' ', '\n', '.', '!', '?', ';', ':', ',']) and word_buffer.strip():
+                        if '\n' in word_buffer:
+                            parts = word_buffer.split('\n')
+                            for i, part in enumerate(parts):
+                                part_stripped = part.strip()
+                                if part_stripped:
+                                    processed = preprocess_text(part_stripped)
+                                    print(f"STREAM >> {repr(processed)}")
+                                    yield f"data: {processed}\n\n"
+                                if i < len(parts) - 1:
+                                    print(f"STREAM >> {repr('')}")
+                                    yield "data: \n\n"
+                        else:
+                            processed = preprocess_text(word_buffer)
+                            print(f"STREAM >> {repr(processed)}")
+                            yield f"data: {processed}\n\n"
+                        word_buffer = ""
+
+            if word_buffer.strip():
+                if '\n' in word_buffer:
+                    parts = word_buffer.split('\n')
+                    for i, part in enumerate(parts):
+                        part_stripped = part.strip()
+                        if part_stripped:
+                            processed = preprocess_text(part_stripped)
+                            print(f"STREAM >> {repr(processed)}")
+                            yield f"data: {processed}\n\n"
+                        if i < len(parts) - 1:
+                            print(f"STREAM >> {repr('')}")
+                            yield "data: \n\n"
+                else:
+                    processed = preprocess_text(word_buffer)
+                    print(f"STREAM >> {repr(processed)}")
+                    yield f"data: {processed}\n\n"
+
+            logger.info(f"====== FINAL WEB SEARCH RESPONSE (session: {session_id}) START ======")
+            logger.info(accumulated_response)
+            logger.info(f"====== FINAL WEB SEARCH RESPONSE (session: {session_id}) END ======")
+            logger.info(f"Total tokens streamed: {token_count}")
+
+            if all_urls:
+                yield "data: \n\n"
+                yield "data: 🔗 Links:\n\n"
+                for uri in all_urls:
+                    yield f"data: {await check_url(uri)}\n\n"
+
+            save_message(session_id, "user", query)
+            save_message(session_id, "assistant", preprocess_text(accumulated_response))
+
+            yield "data: \n\n"
+            yield f"data: ✅ Use session ID: {session_id} to continue.\n\n"
+
+        except Exception as e:
+            error_msg = f"Error: {str(e)}"
+            logger.error(f"Stream error: {error_msg}")
+            yield f"data: {error_msg}\n\n"
+            save_message(session_id, "assistant", f"[System error: {str(e)}]")
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+# Session Management Endpoints
+@app.get("/sessions")
+async def list_sessions():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT session_id FROM conversations ORDER BY timestamp")
+        sessions = [row["session_id"] for row in cur.fetchall()]
+    return {"sessions": sessions}
+
+@app.get("/sessions/{session_id}")
+async def get_session(session_id: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT role, content, timestamp FROM conversations WHERE session_id = ? ORDER BY timestamp",
+            (session_id,)
+        )
+        rows = cur.fetchall()
+        if not rows:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return {
+            "session_id": session_id,
+            "messages": [{"role": r["role"], "content": r["content"], "time": r["timestamp"]} for r in rows]
+        }
+
+@app.delete("/sessions/{session_id}")
+async def delete_session(session_id: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM conversations WHERE session_id = ?", (session_id,))
+        count = cur.fetchone()[0]
+        if count == 0:
+            raise HTTPException(status_code=404, detail="Session not found")
+        cur.execute("DELETE FROM conversations WHERE session_id = ?", (session_id,))
+        conn.commit()
+    return {"message": f"Session {session_id} deleted successfully"}
+
+# Health Check
+@app.get("/")
+async def root():
+    return {"message": "NOVA Assistant is running", "endpoints": ["/chat", "/web_search", "/sessions"]}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import { useState, useRef, useEffect } from "react";
+import ReactMarkdown from "react-markdown";
+import { Button } from "../ui/Button.jsx";
+import API_BASE from "../config";
+
+// Clean and normalize text for markdown rendering
+const preprocessText = (text) => {
+  if (!text) return "";
+
+  let cleaned = text
+    .replace(/\r\n|\r/g, "\n") // Normalize line endings
+    .replace(/\n{3,}/g, "\n\n") // Collapse 3+ line breaks to 2
+    .replace(/([^\n])\n(?!\n|[•①-⑳`>])/g, "$1 ") // Join lines inside a paragraph
+    .replace(/\s+:/g, ":") // Trim space before colons
+    .replace(/ {2,}/g, " ") // Collapse multiple spaces
+    .trim();
+
+  // 🛠 Apply markdown replacements before further cleanup
+  // Bold-italic (***text***)
+  cleaned = cleaned.replace(/\*\*\*(.*?)\*\*\*/gs, (_, p1) => toUnicode(p1.trim(), 'boldItalic'));
+
+  // Bold (**text**)
+  cleaned = cleaned.replace(/\*\*(.*?)\*\*/gs, (_, p1) => toUnicode(p1.trim(), 'bold'));
+
+  // Italic (*text*)
+  cleaned = cleaned.replace(/\*(.*?)\*/gs, (_, p1) => toUnicode(p1.trim(), 'italic'));
+
+  // Inline code
+  cleaned = cleaned.replace(/`([^`]+)`/g, (_, p1) => '💻 ' + toUnicode(p1.trim(), 'mono'));
+
+  // Code blocks
+  cleaned = cleaned.replace(/```(\w*)\n([\s\S]*?)```/gs, (_, lang, code) =>
+    `\n💻 Code${lang ? ` (${lang})` : ''}:\n${toUnicode(code.trim(), 'mono')}\n\n`
+  );
+
+  // Links: [text](url)
+  cleaned = cleaned.replace(/\[(.*?)\]\((.*?)\)/g, (_, label, url) => `${label.trim()} 🔗 ${url.trim()}`);
+
+  // Headings
+  cleaned = cleaned.replace(/^# (.*)$/gm, (_, p1) => `📌 ${toUnicode(p1.trim(), 'bold')}\n`);
+  cleaned = cleaned.replace(/^## (.*)$/gm, (_, p1) => `📍 ${toUnicode(p1.trim(), 'bold')}\n`);
+  cleaned = cleaned.replace(/^### (.*)$/gm, (_, p1) => `▸ ${toUnicode(p1.trim(), 'boldItalic')}\n`);
+  cleaned = cleaned.replace(/^#### (.*)$/gm, (_, p1) => `→ ${toUnicode(p1.trim(), 'italic')}\n`);
+
+  // Lists
+  cleaned = cleaned.replace(/^(\s*)\* (.*)$/gm, (_, indent, item) => `${indent}🔹 ${item.trim()}\n`);
+  cleaned = cleaned.replace(/^(\s*)- (.*)$/gm, (_, indent, item) => `${indent}• ${item.trim()}\n`);
+  cleaned = cleaned.replace(/^(\s*)(\d+)\. (.*)$/gm, (_, indent, num, item) => {
+    const circled = circledNumbers[parseInt(num)] || `${num}.`;
+    return `${indent}${circled} ${item.trim()}\n`;
+  });
+
+  // Blockquotes
+  cleaned = cleaned.replace(/^> (.*)$/gm, (_, p1) => `❝ ${p1.trim()}\n`);
+
+  // Horizontal rules
+  cleaned = cleaned.replace(/^---$/gm, '───\n');
+
+  return cleaned;
+};
+// Unicode transformations
+const toUnicode = (text, style) => {
+  const styles = {
+    bold: ["\u{1D400}", "\u{1D419}"],
+    italic: ["\u{1D434}", "\u{1D44D}"],
+    boldItalic: ["\u{1D468}", "\u{1D481}"],
+    mono: ["\u{1D7F6}", "\u{1D7FF}"],
+  };
+
+  const [start, end] = styles[style] || [];
+  if (!start || !end) return text;
+
+  return text.split("").map((char) => {
+    const code = char.codePointAt(0);
+    if (code >= 0x41 && code <= 0x5A) {
+      // Uppercase A-Z
+      return String.fromCodePoint(code + (start.codePointAt(0) - 65));
+    } else if (code >= 0x61 && code <= 0x7A) {
+      // Lowercase a-z
+      return String.fromCodePoint(code + (start.codePointAt(0) - 97));
+    }
+    return char;
+  }).join("");
+};
+
+// Optional export
+const generateMarkdown = (userMsg, assistantMsg, timestamp) => {
+  const date = new Date(timestamp).toLocaleString();
+  return `📍 Chat Exchange - ${date}\n\nUser: ${userMsg.content}\n\nAssistant:\n${assistantMsg.content}\n\n───\n`;
+};
+
+export default function Chat({ sessionId: propSessionId }) {
+  const [message, setMessage] = useState("");
+  const [messages, setMessages] = useState([]);
+  const [sessionId, setSessionId] = useState(propSessionId);
+  const [isWebSearch, setIsWebSearch] = useState(false);
+  const abortControllerRef = useRef(null);
+  const messagesEndRef = useRef(null);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  const handleSendMessage = async () => {
+    if (!message.trim()) return;
+
+    const endpoint = isWebSearch ? "/web_search" : "/chat";
+    const userMessage = {
+      role: "user",
+      content: message,
+      isWebSearch,
+      timestamp: new Date().toISOString(),
+    };
+
+    setMessages((prev) => [...prev, userMessage]);
+    setMessage("");
+    setIsWebSearch(false);
+
+    if (abortControllerRef.current) abortControllerRef.current.abort();
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
+    try {
+      const response = await fetch(`${API_BASE}${endpoint}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+        },
+        body: JSON.stringify({
+          message,
+          ...(sessionId && { session_id: sessionId }),
+        }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) throw new Error(`Request failed: ${response.status}`);
+
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content: "",
+          isWebSearch,
+          timestamp: new Date().toISOString(),
+        },
+      ]);
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let accumulatedContent = "";
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value, { stream: true });
+        buffer += chunk;
+
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop() || "";
+
+        for (const part of parts) {
+          const trimmed = part.trim();
+          if (!trimmed.startsWith("data:")) continue;
+
+          const data = trimmed.slice(5).trim();
+          if (data === "[DONE]") continue;
+
+          accumulatedContent += data + "\n";
+
+          setMessages((prev) => {
+            const last = prev[prev.length - 1];
+            if (last.role === "assistant") {
+              return [
+                ...prev.slice(0, -1),
+                { ...last, content: preprocessText(accumulatedContent) },
+              ];
+            }
+            return prev;
+          });
+        }
+      }
+
+      const finalContent = preprocessText(accumulatedContent);
+      setMessages((prev) => {
+        const last = prev[prev.length - 1];
+        if (last.role === "assistant") {
+          return [...prev.slice(0, -1), { ...last, content: finalContent }];
+        }
+        return prev;
+      });
+    } catch (err) {
+      if (err.name !== "AbortError") {
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "error",
+            content: `Error: ${err.message}`,
+            timestamp: new Date().toISOString(),
+          },
+        ]);
+      }
+    } finally {
+      abortControllerRef.current = null;
+    }
+  };
+
+  const handleCopyMarkdown = (userMsg, assistantMsg) => {
+    const markdown = generateMarkdown(userMsg, assistantMsg, userMsg.timestamp);
+    navigator.clipboard
+      .writeText(markdown)
+      .then(() => alert("Text copied to clipboard!"))
+      .catch((err) => alert(`Failed to copy: ${err.message}`));
+  };
+
+  const handleKeyDown = (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleSendMessage();
+    }
+  };
+
+  return (
+    <div className="flex flex-col min-h-screen bg-gray-50">
+      <div className="bg-white border-b border-gray-200 px-4 py-3">
+        <div className="max-w-5xl mx-auto">
+          <span
+            className={`px-3 py-1 rounded-full text-xs sm:text-sm font-medium ${
+              isWebSearch
+                ? "bg-blue-100 text-blue-800"
+                : "bg-gray-100 text-gray-800"
+            }`}
+          >
+            {isWebSearch ? "🌐 Web Search Mode" : "💬 Chat Mode"}
+          </span>
+        </div>
+      </div>
+
+      <div className="flex-1 overflow-y-auto p-3 sm:p-6 space-y-6 max-w-5xl mx-auto w-full">
+        {messages.map((msg, index) => {
+          const isUser = msg.role === "user";
+          const isError = msg.role === "error";
+          const assistantMsg =
+            isUser &&
+            index < messages.length - 1 &&
+            messages[index + 1]?.role === "assistant"
+              ? messages[index + 1]
+              : null;
+
+          return (
+            <div
+              key={index}
+              className={`flex ${
+                isUser ? "justify-end" : "justify-start"
+              } w-full relative group`}
+            >
+              <div
+                className={`w-full max-w-[95%] sm:max-w-[90%] md:max-w-[85%] lg:max-w-[80%] rounded-lg p-4 sm:p-5 text-sm sm:text-base break-words shadow-sm ${
+                  isUser
+                    ? isWebSearch
+                      ? "bg-purple-600 text-white"
+                      : "bg-blue-600 text-white"
+                    : isError
+                    ? "bg-red-50 text-red-800 border-l-4 border-red-400"
+                    : msg.isWebSearch
+                    ? "bg-blue-50 border border-blue-200 text-gray-800"
+                    : "bg-white border border-gray-200 text-gray-800"
+                }`}
+              >
+                {/* Optional label */}
+                {msg.isWebSearch && msg.role !== "user" && (
+                  <div className="text-xs text-blue-600 mb-3 font-medium">
+                    🌐 Web Search Results
+                  </div>
+                )}
+
+                <div className="whitespace-pre-wrap leading-relaxed prose prose-sm sm:prose-base max-w-none">
+                  <ReactMarkdown>{preprocessText(msg.content)}</ReactMarkdown>
+                </div>
+
+                {assistantMsg && (
+                  <button
+                    onClick={() => handleCopyMarkdown(msg, assistantMsg)}
+                    className="absolute top-3 right-3 p-1.5 text-gray-400 hover:text-gray-600 opacity-0 group-hover:opacity-100 transition-all duration-200 bg-white/80 rounded hover:bg-white/90"
+                    title="Copy as Text"
+                  >
+                    <svg
+                      className="w-4 h-4"
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="0 0 24 24"
+                      xmlns="http://www.w3.org/2000/svg"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth="2"
+                        d="M8 7v8a2 2 0 002 2h6a2 2 0 002-2V7m-4 0V5a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2h2"
+                      ></path>
+                    </svg>
+                  </button>
+                )}
+              </div>
+            </div>
+          );
+        })}
+        <div ref={messagesEndRef} />
+      </div>
+
+      <div className="bg-white border-t border-gray-200 p-4">
+        <div className="max-w-5xl mx-auto flex items-end gap-2">
+          <textarea
+            value={message}
+            onChange={(e) => setMessage(e.target.value)}
+            onKeyDown={handleKeyDown}
+            rows={1}
+            className="flex-1 resize-none rounded-md border border-gray-300 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 p-3 text-sm sm:text-base"
+            placeholder="Type your message here..."
+          />
+          <Button onClick={handleSendMessage}>Send</Button>
+          <Button
+            onClick={() => setIsWebSearch(!isWebSearch)}
+            variant={isWebSearch ? "secondary" : "outline"}
+          >
+            🌐
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}

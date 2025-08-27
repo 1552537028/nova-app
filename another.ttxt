@@ -1,0 +1,839 @@
+import re
+import httpx
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from openai import OpenAI
+from duckduckgo_search import DDGS
+from datetime import datetime
+from typing import AsyncGenerator
+import wikipediaapi
+import sqlite3
+import os
+from fastapi.middleware.cors import CORSMiddleware
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+# CORS Middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Database Setup
+DB_PATH = "data.db"
+
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS conversations (
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+
+init_db()
+
+def load_conversation(session_id: str) -> list[dict]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT role, content FROM conversations
+            WHERE session_id = ?
+            ORDER BY timestamp
+        """, (session_id,))
+        return [{"role": row["role"], "content": row["content"]} for row in cursor.fetchall()]
+
+def save_message(session_id: str, role: str, content: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO conversations (session_id, role, content) VALUES (?, ?, ?)",
+            (session_id, role, content)
+        )
+        conn.commit()
+
+# Models
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=1000)
+    session_id: str = None
+
+# OpenAI Client to Local LLM
+client = OpenAI(
+    base_url="http://model-runner.docker.internal/engines/llama.cpp/v1",
+    api_key="not-needed"
+)
+
+# Wikipedia API Client
+wiki = wikipediaapi.Wikipedia(
+    language='en',
+    extract_format=wikipediaapi.ExtractFormat.WIKI,
+    user_agent="NOVA/1.0 (jayanthkopparthi595@gmail.com)"
+)
+
+# Assistant Persona
+CHAT_SYSTEM_PROMPT = """You are NOVA, a highly accurate, empathetic, and user-friendly personal assistant. just with all the features you can provide"""
+
+WEB_SEARCH_SYSTEM_PROMPT = """You are NOVA, an expert research assistant focused on delivering accurate and reliable information.
+- Summarize information from provided sources (e.g., web results, Wikipedia) into a concise, coherent response.
+- Prioritize credible sources, citing them clearly (e.g., "Wikipedia states..." or "A web source from [site] reports...").
+- Include key facts, dates, definitions, or notable controversies, avoiding unnecessary details.
+- If sources conflict, highlight discrepancies and provide a balanced summary.
+- Verify all URLs for accessibility and relevance before including them.
+- If no reliable sources are found, state this clearly and suggest alternative ways to find information.
+- Stay up-to-date with {current_time} for time-sensitive queries.
+- Structure responses with clear sections (e.g., "Key Facts," "Sources") for readability.
+- Never invent facts, sources, or details. If data is incomplete, acknowledge it.
+- Ensure all text has proper spacing between words and proper formatting.
+"""
+
+# URL Regex & Checker
+url_pattern = re.compile(r'https?://[\w\-./?=&%]+', re.IGNORECASE)
+
+async def check_url(url: str) -> str:
+    if url.lower().startswith("javascript:"):
+        return f"{url} (unsafe)"
+    try:
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
+            r = await client.get(url, headers={"User-Agent": "NOVA/1.0"})
+            return f"{url} (accessible)" if r.status_code == 200 else f"{url} (status {r.status_code})"
+    except Exception as e:
+        return f"{url} ({e.__class__.__name__})"
+
+# Chat Endpoint with Memory
+@app.post("/chat")
+async def chat_stream(request: ChatRequest) -> StreamingResponse:
+    current_time = datetime.now().strftime("%B %d, %Y, %I:%M %p %Z")
+    session_id = request.session_id or f"sess_{int(datetime.now().timestamp())}_{os.urandom(4).hex()}"
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        try:
+            accumulated_response = ""
+            token_count = 0
+
+            messages = [
+                {"role": "system", "content": CHAT_SYSTEM_PROMPT.format(current_time=current_time)}
+            ] + load_conversation(session_id) + [
+                {"role": "user", "content": request.message}
+            ]
+
+            stream = client.chat.completions.create(
+                model="ai/gemma3",
+                messages=messages,
+                stream=True,
+                temperature=0.7,
+                max_tokens=2048
+            )
+
+            word_buffer = ""
+
+            for chunk in stream:
+                if chunk.choices[0].delta.content:
+                    content = chunk.choices[0].delta.content
+                    accumulated_response += content
+                    token_count += 1
+
+                    logger.debug(f"[Token {token_count}] {content.strip()}")
+
+                    for char in content:
+                        word_buffer += char
+                        if char in [' ', '\n', '.', '!', '?', ';', ':', ','] and word_buffer.strip():
+                            if '\n' in word_buffer:
+                                parts = word_buffer.split('\n')
+                                for i, part in enumerate(parts):
+                                    part_stripped = part.strip()
+                                    if part_stripped:
+                                        print(f"STREAM >> {repr(part_stripped)}")
+                                        yield f"data: {part_stripped}\n\n"
+                                    if i < len(parts) - 1:
+                                        print(f"STREAM >> {repr('')}")
+                                        yield "data: \n\n"
+                            else:
+                                print(f"STREAM >> {repr(word_buffer)}")
+                                yield f"data: {word_buffer}\n\n"
+                            word_buffer = ""
+
+            if word_buffer.strip():
+                if '\n' in word_buffer:
+                    parts = word_buffer.split('\n')
+                    for i, part in enumerate(parts):
+                        part_stripped = part.strip()
+                        if part_stripped:
+                            print(f"STREAM >> {repr(part_stripped)}")
+                            yield f"data: {part_stripped}\n\n"
+                        if i < len(parts) - 1:
+                            print(f"STREAM >> {repr('')}")
+                            yield "data: \n\n"
+                else:
+                    print(f"STREAM >> {repr(word_buffer)}")
+                    yield f"data: {word_buffer}\n\n"
+
+            logger.info(f"====== FINAL CHAT RESPONSE (session: {session_id}) START ======")
+            logger.info(accumulated_response)
+            logger.info(f"====== FINAL CHAT RESPONSE (session: {session_id}) END ======")
+            logger.info(f"Total tokens streamed: {token_count}")
+
+            urls = url_pattern.findall(accumulated_response)
+            if urls:
+                yield "data: \n\n"
+                yield "data: 🔗 Links found:\n\n"
+                for url in urls:
+                    yield f"data: {await check_url(url)}\n\n"
+
+            save_message(session_id, "user", request.message)
+            save_message(session_id, "assistant", accumulated_response)
+
+            yield "data: \n\n"
+            yield f"data: ✅ Continue this chat with session ID: `{session_id}`\n\n"
+
+        except Exception as e:
+            error_msg = f"Error: {str(e)}"
+            logger.error(f"Stream error: {error_msg}")
+            yield f"data: {error_msg}\n\n"
+            save_message(session_id, "assistant", f"[System error: {str(e)}]")
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+# Web Search with Memory
+@app.post("/web_search")
+async def web_search(request: ChatRequest) -> StreamingResponse:
+    current_time = datetime.now().strftime("%B %d, %Y, %I:%M %p %Z")
+    query = request.message
+    session_id = request.session_id or f"sess_{int(datetime.now().timestamp())}_{os.urandom(4).hex()}"
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        try:
+            summary_prompt = WEB_SEARCH_SYSTEM_PROMPT.format(current_time=current_time) + "\n\nAnalyze and summarize the following sources:\n\n"
+            all_urls = []
+
+            try:
+                dd_results = DDGS().text(query, max_results=5)
+                if dd_results:
+                    summary_prompt += "=== Web Results (DuckDuckGo) ===\n"
+                    for i, r in enumerate(dd_results, 1):
+                        summary_prompt += f"{i}. [{r['title']}]({r['href']})\n   {r['body']}\n\n"
+                        all_urls.append(r['href'])
+            except Exception as e:
+                summary_prompt += f"⚠️ Could not fetch web results: {str(e)}\n\n"
+
+            try:
+                wiki_page = wiki.page(query)
+                if wiki_page.exists():
+                    summary_prompt += f"=== Wikipedia Entry: {wiki_page.title} ===\n{wiki_page.summary[:1200]}{'...' if len(wiki_page.summary) > 1200 else ''}\n\n"
+                    all_urls.append(wiki_page.fullurl)
+                else:
+                    summary_prompt += f"⚠️ No Wikipedia page found for '{query}'.\n\n"
+            except Exception as e:
+                summary_prompt += f"⚠️ Error fetching Wikipedia: {str(e)}\n\n"
+
+            if "⚠️ Could not fetch" in summary_prompt and "=== Wikipedia Entry" not in summary_prompt:
+                response = f"⚡ No reliable information found for *{query}* as of {current_time}. Try a different phrasing."
+                yield f"data: {response}\n\n"
+                save_message(session_id, "user", query)
+                save_message(session_id, "assistant", response)
+                yield "data: \n\n"
+                yield "data: 📌 Tip: Be specific and use full terms (e.g., 'climate change effects on oceans').\n\n"
+                yield f"data: ✅ Use session ID: `{session_id}` to continue.\n\n"
+                logger.info(f"Final web search response for session {session_id} (NO SOURCES):\n{response}")
+                return
+
+            context_messages = [
+                {"role": "system", "content": summary_prompt},
+                {"role": "user", "content": f"Summarize the key facts about: {query}"}
+            ] + load_conversation(session_id)[-4:]
+
+            stream = client.chat.completions.create(
+                model="ai/gemma3",
+                messages=context_messages,
+                stream=True,
+                temperature=0.7,
+                max_tokens=2048
+            )
+
+            accumulated_response = ""
+            token_count = 0
+            word_buffer = ""
+
+            for chunk in stream:
+                if chunk.choices[0].delta.content:
+                    content = chunk.choices[0].delta.content
+                    accumulated_response += content
+                    token_count += 1
+                    logger.debug(f"[Token {token_count}] {content.strip()}")
+
+                    for char in content:
+                        word_buffer += char
+                        if char in [' ', '\n', '.', '!', '?', ';', ':', ','] and word_buffer.strip():
+                            if '\n' in word_buffer:
+                                parts = word_buffer.split('\n')
+                                for i, part in enumerate(parts):
+                                    part_stripped = part.strip()
+                                    if part_stripped:
+                                        print(f"STREAM >> {repr(part_stripped)}")
+                                        yield f"data: {part_stripped}\n\n"
+                                    if i < len(parts) - 1:
+                                        print(f"STREAM >> {repr('')}")
+                                        yield "data: \n\n"
+                            else:
+                                print(f"STREAM >> {repr(word_buffer)}")
+                                yield f"data: {word_buffer}\n\n"
+                            word_buffer = ""
+
+            if word_buffer.strip():
+                if '\n' in word_buffer:
+                    parts = word_buffer.split('\n')
+                    for i, part in enumerate(parts):
+                        part_stripped = part.strip()
+                        if part_stripped:
+                            print(f"STREAM >> {repr(part_stripped)}")
+                            yield f"data: {part_stripped}\n\n"
+                        if i < len(parts) - 1:
+                            print(f"STREAM >> {repr('')}")
+                            yield "data: \n\n"
+                else:
+                    print(f"STREAM >> {repr(word_buffer)}")
+                    yield f"data: {word_buffer}\n\n"
+
+            logger.info(f"====== FINAL WEB SEARCH RESPONSE (session: {session_id}) START ======")
+            logger.info(accumulated_response)
+            logger.info(f"====== FINAL WEB SEARCH RESPONSE (session: {session_id}) END ======")
+            logger.info(f"Total tokens streamed: {token_count}")
+
+            if all_urls:
+                yield "data: \n\n"
+                yield "data: 🔗 Links:\n\n"
+                for url in all_urls:
+                    yield f"data: {await check_url(url)}\n\n"
+
+            save_message(session_id, "user", query)
+            save_message(session_id, "assistant", accumulated_response)
+
+            yield "data: \n\n"
+            yield f"data: ✅ Use session ID: `{session_id}` to continue.\n\n"
+
+        except Exception as e:
+            error_msg = f"Error: {str(e)}"
+            logger.error(f"Stream error: {error_msg}")
+            yield f"data: {error_msg}\n\n"
+            save_message(session_id, "assistant", f"[System error: {str(e)}]")
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import { useState, useRef, useEffect } from "react";
+import { Button } from "../ui/Button.jsx";
+import ReactMarkdown from "react-markdown";
+import rehypeSanitize from "rehype-sanitize";
+import rehypeRaw from "rehype-raw";
+import remarkGfm from "remark-gfm";
+import API_BASE from "../config";
+
+// Normalize individual SSE chunks to preserve markdown structure
+const normalizeChunk = (chunk) => {
+  if (!chunk) return "";
+  // Remove stray control characters, preserve markdown syntax
+  return chunk.replace(/[\r\f]/g, "");
+};
+
+const preprocessMarkdown = (text) => {
+  if (!text) return "";
+
+  let cleaned = text
+    // Remove "nova-ai |" and similar prefixes from each line
+    .replace(/^nova-ai\s*\|\s*/gm, "")
+    // Remove "INFO:app:" and similar log prefixes
+    .replace(/^INFO:app:\s*/gm, "")
+    // Normalize line endings
+    .replace(/\r\n|\r/g, "\n")
+    // Fix overused bold/italic
+    .replace(/\*{3,}/g, "**")
+    // Clean up bold headers: '**Title:\n**' → '**Title:**'
+    .replace(/\*\*([^\n]+?):\s*\n\s*\*\*/g, "**$1:**")
+    // Collapse 3+ line breaks into 2
+    .replace(/\n{3,}/g, "\n\n")
+    // Join lines that are part of the same paragraph (not bullets or headings)
+    .replace(/([^\n])\n(?!\n|[*#`>])/g, "$1 ")
+    // Normalize bullet formatting
+    .replace(/^\s*\*\s+\*\*/gm, "* **")
+    // Convert bold headers with colons into proper bullet points
+    .replace(/^\s*\*\*\s*([^:]+?):\s*\*\*\s*(.+)/gm, "* **$1:** $2")
+    // Ensure correct spacing after bullet stars
+    .replace(/^\*\s*(?!\*)([^\n]+)/gm, "* $1")
+    // Remove extra space before colons
+    .replace(/\s+:/g, ":")
+    // Collapse double spaces
+    .replace(/ {2,}/g, " ")
+    // Final trim
+    .trim();
+
+  return cleaned;
+};
+
+const generateMarkdown = (userMsg, assistantMsg, timestamp) => {
+  const date = new Date(timestamp).toLocaleString();
+  return `## 📌 Chat Exchange - ${date}\n\n**User:** ${userMsg.content}\n\n**Assistant:**\n${assistantMsg.content}\n\n---\n`;
+};
+
+export default function Chat({ sessionId: propSessionId }) {
+  const [message, setMessage] = useState("");
+  const [messages, setMessages] = useState([]);
+  const [sessionId, setSessionId] = useState(propSessionId);
+  const [isWebSearch, setIsWebSearch] = useState(false);
+  const abortControllerRef = useRef(null);
+  const messagesEndRef = useRef(null);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  const handleSendMessage = async () => {
+    if (!message.trim()) return;
+
+    const endpoint = isWebSearch ? "/web_search" : "/chat";
+    const userMessage = {
+      role: "user",
+      content: message,
+      isWebSearch,
+      timestamp: new Date().toISOString(),
+    };
+
+    setMessages((prev) => [...prev, userMessage]);
+    setMessage("");
+    setIsWebSearch(false);
+
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
+    try {
+      const response = await fetch(`${API_BASE}${endpoint}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": "text/event-stream",
+        },
+        body: JSON.stringify({
+          message,
+          ...(sessionId && { session_id: sessionId }),
+        }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        throw new Error(`Request failed: ${response.status}`);
+      }
+
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content: "",
+          isWebSearch,
+          timestamp: new Date().toISOString(),
+        },
+      ]);
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let accumulatedContent = "";
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value, { stream: true });
+        buffer += chunk;
+
+        // Split by \n\n to process complete SSE events
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop() || ""; // Keep incomplete parts in buffer
+
+        for (const part of parts) {
+          const trimmed = part.trim();
+          if (!trimmed || !trimmed.startsWith("data:")) continue;
+
+          const data = normalizeChunk(trimmed.slice(5));
+          if (data === "[DONE]") continue;
+
+          if (data.includes("\n**") || data.includes("**\n")) {
+            console.warn("Potential malformed markdown chunk:", data);
+          }
+          // Accumulate content, preserving markdown structure
+          accumulatedContent += data + "\n";
+
+          // Update messages with preprocessed content
+          setMessages((prev) => {
+            const last = prev[prev.length - 1];
+            if (last.role === "assistant") {
+              return [
+                ...prev.slice(0, -1),
+                { ...last, content: preprocessMarkdown(accumulatedContent) },
+              ];
+            }
+            return prev;
+          });
+        }
+      }
+
+      // Finalize content with preprocessing
+      const finalContent = preprocessMarkdown(accumulatedContent);
+      setMessages((prev) => {
+        const last = prev[prev.length - 1];
+        if (last.role === "assistant") {
+          return [
+            ...prev.slice(0, -1),
+            { ...last, content: finalContent },
+          ];
+        }
+        return prev;
+      });
+
+    } catch (err) {
+      if (err.name !== "AbortError") {
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "error",
+            content: `Error: ${err.message}`,
+            timestamp: new Date().toISOString(),
+          },
+        ]);
+      }
+    } finally {
+      abortControllerRef.current = null;
+    }
+  };
+
+  const handleCopyMarkdown = (userMsg, assistantMsg) => {
+    const markdown = generateMarkdown(userMsg, assistantMsg, userMsg.timestamp);
+    navigator.clipboard
+      .writeText(markdown)
+      .then(() => alert("Markdown copied to clipboard!"))
+      .catch((err) => alert(`Failed to copy: ${err.message}`));
+  };
+
+  const handleKeyDown = (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleSendMessage();
+    }
+  };
+
+  // Enhanced markdown components with Unicode and font styles
+  const markdownComponents = {
+    h1: ({ children }) => (
+      <h1 className="font-serif text-2xl font-bold mt-6 mb-4 text-gray-800 border-b border-gray-200 pb-2">
+        📌 {children}
+      </h1>
+    ),
+    h2: ({ children }) => (
+      <h2 className="font-serif text-xl font-semibold mt-5 mb-3 text-gray-800">
+        📌 {children}
+      </h2>
+    ),
+    h3: ({ children }) => (
+      <h3 className="font-serif text-lg font-medium mt-4 mb-2 text-gray-700">
+        📌 {children}
+      </h3>
+    ),
+    h4: ({ children }) => (
+      <h4 className="font-serif text-base font-medium mt-3 mb-2 text-gray-700">
+        📌 {children}
+      </h4>
+    ),
+    p: ({ children }) => (
+      <p className="font-sans text-base mb-3 leading-relaxed text-gray-700 whitespace-pre-wrap">
+        {children}
+      </p>
+    ),
+    strong: ({ children }) => (
+      <strong className="font-sans font-semibold text-gray-800">
+        {children}
+      </strong>
+    ),
+    em: ({ children }) => (
+      <em className="font-sans italic text-gray-600">
+        {children}
+      </em>
+    ),
+    ul: ({ children }) => (
+      <ul className="mb-4 pl-6 space-y-1 list-none">
+        {children}
+      </ul>
+    ),
+    li: ({ children }) => (
+      <li className="font-sans text-gray-700 leading-relaxed whitespace-pre-wrap flex items-start">
+        <span className="mr-2">•</span>
+        <ReactMarkdown
+          components={markdownComponents}
+          rehypePlugins={[rehypeRaw, [rehypeSanitize, { tagNames: ["*"] }]]}
+          remarkPlugins={[remarkGfm]}
+        >
+          {preprocessMarkdown(String(children))}
+        </ReactMarkdown>
+      </li>
+    ),
+    ol: ({ children }) => (
+      <ol className="mb-4 pl-6 space-y-1 list-decimal">
+        {children}
+      </ol>
+    ),
+    a: ({ href, children }) => (
+      <a
+        href={href}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="font-sans text-blue-600 hover:text-blue-800 underline decoration-1 hover:decoration-2 transition-all duration-200 break-all"
+      >
+        🔗 {children}
+      </a>
+    ),
+    code: ({ inline, children }) =>
+      inline ? (
+        <code className="font-mono bg-gray-100 text-gray-800 px-1.5 py-0.5 rounded text-sm">
+          💻 {children}
+        </code>
+      ) : (
+        <pre className="font-mono bg-gray-100 border border-gray-200 p-4 rounded-md my-4 overflow-x-auto whitespace-pre-wrap">
+          <code className="text-sm text-gray-800 leading-relaxed">
+            💻 {children}
+          </code>
+        </pre>
+      ),
+    blockquote: ({ children }) => (
+      <blockquote className="font-serif border-l-4 border-blue-500 bg-blue-50 pl-4 py-2 my-4 italic text-gray-700">
+        ❝ {children}
+      </blockquote>
+    ),
+    hr: () => <hr className="my-6 border-gray-300" />,
+    table: ({ children }) => (
+      <div className="overflow-x-auto my-4">
+        <table className="min-w-full border-collapse border border-gray-300">
+          {children}
+        </table>
+      </div>
+    ),
+    thead: ({ children }) => (
+      <thead className="bg-gray-100">{children}</thead>
+    ),
+    tbody: ({ children }) => <tbody>{children}</tbody>,
+    tr: ({ children }) => (
+      <tr className="border-b border-gray-200">{children}</tr>
+    ),
+    th: ({ children }) => (
+      <th className="font-sans border border-gray-300 px-4 py-2 text-left font-semibold text-gray-800">
+        {children}
+      </th>
+    ),
+    td: ({ children }) => (
+      <td className="font-sans border border-gray-300 px-4 py-2 text-gray-700">
+        {children}
+      </td>
+    ),
+  };
+
+  return (
+    <div className="flex flex-col min-h-screen bg-gray-50">
+      <div className="bg-white border-b border-gray-200 px-4 py-3">
+        <div className="max-w-5xl mx-auto">
+          <div className="flex items-center gap-2">
+            <span
+              className={`px-3 py-1 rounded-full text-xs sm:text-sm font-medium transition-colors ${
+                isWebSearch
+                  ? "bg-blue-100 text-blue-800"
+                  : "bg-gray-100 text-gray-800"
+              }`}
+            >
+              {isWebSearch ? "🌐 Web Search Mode" : "💬 Chat Mode"}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div className="flex-1 overflow-y-auto p-3 sm:p-6 space-y-6 max-w-5xl mx-auto w-full">
+        {messages.map((msg, index) => {
+          const baseClasses =
+            "w-full max-w-[95%] sm:max-w-[90%] md:max-w-[85%] lg:max-w-[80%] rounded-lg p-4 sm:p-5 text-sm sm:text-base break-words shadow-sm";
+
+          let specificClasses = "";
+          let label = null;
+
+          if (msg.role === "user") {
+            specificClasses = msg.isWebSearch
+              ? "bg-purple-600 text-white"
+              : "bg-blue-600 text-white";
+            if (msg.isWebSearch) {
+              label = (
+                <div className="text-xs font-medium mb-2 opacity-90 flex items-center gap-1">
+                  🔍 Web Search Request
+                </div>
+              );
+            }
+          } else if (msg.role === "error") {
+            specificClasses = "bg-red-50 text-red-800 border-l-4 border-red-400";
+          } else {
+            specificClasses = msg.isWebSearch
+              ? "bg-blue-50 border border-blue-200 text-gray-800"
+              : "bg-white border border-gray-200 text-gray-800";
+            if (msg.isWebSearch) {
+              label = (
+                <div className="text-xs text-blue-600 mb-3 flex items-center gap-1 font-medium">
+                  🌐 Web Search Results
+                </div>
+              );
+            }
+          }
+
+          const isLastUserMessage =
+            msg.role === "user" &&
+            index < messages.length - 1 &&
+            messages[index + 1].role === "assistant";
+          const assistantMsg = isLastUserMessage ? messages[index + 1] : null;
+
+          return (
+            <div
+              key={index}
+              className={`flex ${
+                msg.role === "user" ? "justify-end" : "justify-start"
+              } w-full relative group`}
+            >
+              <div className={`${baseClasses} ${specificClasses}`}>
+                {label}
+
+                <div className="whitespace-pre-wrap leading-relaxed">
+                  {msg.role === "user" || msg.role === "error" ? (
+                    <span>{preprocessMarkdown(msg.content)}</span>
+                  ) : (
+                    <ReactMarkdown
+                      components={markdownComponents}
+                      rehypePlugins={[rehypeRaw, [rehypeSanitize, { tagNames: ["*"] }]]}
+                      remarkPlugins={[remarkGfm]}
+                    >
+                      {preprocessMarkdown(msg.content)}
+                    </ReactMarkdown>
+                  )}
+                </div>
+
+                {isLastUserMessage && (
+                  <button
+                    onClick={() => handleCopyMarkdown(msg, assistantMsg)}
+                    className="absolute top-3 right-3 p-1.5 text-gray-400 hover:text-gray-600 opacity-0 group-hover:opacity-100 transition-all duration-200 bg-white/80 rounded hover:bg-white/90"
+                    title="Copy as Markdown"
+                  >
+                    <svg
+                      className="w-4 h-4"
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="0 0 24 24"
+                      xmlns="http://www.w3.org/2000/svg"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth="2"
+                        d="M8 7v8a2 2 0 002 2h6a2 2 0 002-2V7m-4 0V5a2 2 0 00-2-2h-2a2 2 0 00-2 2v2"
+                      />
+                    </svg>
+                  </button>
+                )}
+              </div>
+            </div>
+          );
+        })}
+        <div ref={messagesEndRef} />
+      </div>
+
+      <div className="p-4 sm:p-6 bg-white border-t border-gray-200 sticky bottom-0 z-10 shadow-lg">
+        <div className="max-w-5xl mx-auto w-full">
+          <div className="relative flex items-center gap-3">
+            <div className="relative flex-1">
+              <input
+                className="w-full border border-gray-300 rounded-lg p-3 pl-12 pr-24 sm:pr-28 text-sm sm:text-base focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
+                placeholder={
+                  isWebSearch
+                    ? "🔍 Enter your web search query..."
+                    : "💬 Type your message..."
+                }
+                value={message}
+                onChange={(e) => setMessage(e.target.value)}
+                onKeyDown={handleKeyDown}
+              />
+              <button
+                onClick={() => setIsWebSearch(!isWebSearch)}
+                className={`absolute left-2 top-1/2 -translate-y-1/2 p-1.5 rounded-full text-xs sm:text-sm font-medium flex items-center gap-1 transition-all duration-200 ${
+                  isWebSearch
+                    ? "bg-purple-600 text-white hover:bg-purple-700 shadow-md"
+                    : "bg-gray-200 text-gray-700 hover:bg-gray-300"
+                }`}
+                title={
+                  isWebSearch ? "Switch to Chat Mode" : "Switch to Web Search Mode"
+                }
+              >
+                <svg
+                  className="w-4 h-4"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                  xmlns="http://www.w3.org/2000/svg"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth="2"
+                    d="M21 21l-4.35-4.35M16.5 10.5a6 6 0 11-12 0 6 6 0 0112 0z"
+                  />
+                </svg>
+                <span className="hidden sm:inline">Web</span>
+              </button>
+            </div>
+            <Button
+              onClick={handleSendMessage}
+              disabled={!message.trim()}
+              className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed text-white px-4 sm:px-6 py-3 text-sm sm:text-base transition-all duration-200 shadow-md hover:shadow-lg"
+            >
+              Send
+            </Button>
+          </div>
+          <div className="text-center mt-3 text-xs sm:text-sm text-gray-500">
+            {isWebSearch ? (
+              " Your next message will perform a web search"
+            ) : (
+              " Chatting normally with the AI assistant"
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,7 @@
+FROM python:3.9-slim
+
+RUN pip install duckduckgo_search httpx fastapi uvicorn openai wikipedia-api
+
+COPY . .
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]

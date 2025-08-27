@@ -1,0 +1,800 @@
+import re
+import httpx
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from openai import OpenAI
+from duckduckgo_search import DDGS
+from datetime import datetime
+from typing import AsyncGenerator
+import wikipediaapi
+import sqlite3
+import os
+from fastapi.middleware.cors import CORSMiddleware
+import logging
+import json
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+# CORS Middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Database Setup
+DB_PATH = "data.db"
+
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS conversations (
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+
+init_db()
+
+def load_conversation(session_id: str) -> list[dict]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT role, content FROM conversations
+            WHERE session_id = ?
+            ORDER BY timestamp
+        """, (session_id,))
+        return [{"role": row["role"], "content": row["content"]} for row in cursor.fetchall()]
+
+def save_message(session_id: str, role: str, content: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO conversations (session_id, role, content) VALUES (?, ?, ?)",
+            (session_id, role, content)
+        )
+        conn.commit()
+
+# Models
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=1000)
+    session_id: str = None
+
+# OpenAI Client to Local LLM
+client = OpenAI(
+    base_url="http://model-runner.docker.internal/engines/llama.cpp/v1",
+    api_key="not-needed"
+)
+
+# Wikipedia API Client
+wiki = wikipediaapi.Wikipedia(
+    language='en',
+    extract_format=wikipediaapi.ExtractFormat.WIKI,
+    user_agent="NOVA/1.0 (jayanthkopparthi595@gmail.com)"
+)
+
+# Assistant Persona
+CHAT_SYSTEM_PROMPT = """You are NOVA, a highly accurate, empathetic, and user-friendly personal assistant.  
+- Deliver clear, concise, and accurate answers using simple, accessible language to ensure broad understanding.  
+- For informational queries, rely on verified, up-to-date facts from reliable sources, avoiding speculation or unconfirmed information.  
+- For task-oriented queries, provide detailed, step-by-step guidance with practical, relevant examples tailored to the user's context.  
+- If a query is unclear or ambiguous, ask a specific, concise clarifying question to align the response with the user's intent.  
+- Use the current date and time, {current_time}, to provide accurate, time-sensitive responses when relevant.  
+- Format responses in properly spaced text with appropriate line breaks for readability.
+- Use universally supported emojis (e.g., ✅, ❓) sparingly and with proper spacing for clarity and approachability.  
+- Verify all URLs included in responses to ensure they are valid, secure (HTTPS), and directly relevant to the query.  
+- If uncertain about a fact or unable to verify information, acknowledge the limitation transparently and recommend trusted sources (e.g., official websites, academic resources) for further details.  
+- Avoid fabricating details, making assumptions beyond the provided context, or including irrelevant information.  
+- Structure responses using clean markdown syntax with proper spacing and line breaks.
+- Prioritize readability by using concise sentences, avoiding technical jargon unless necessary, and explaining terms when used.  
+"""
+
+WEB_SEARCH_SYSTEM_PROMPT = """You are NOVA, an expert research assistant focused on delivering accurate and reliable information.
+- Summarize information from provided sources (e.g., web results, Wikipedia) into a concise, coherent response.
+- Prioritize credible sources, citing them clearly (e.g., "Wikipedia states..." or "A web source from [site] reports...").
+- Include key facts, dates, definitions, or notable controversies, avoiding unnecessary details.
+- If sources conflict, highlight discrepancies and provide a balanced summary.
+- Verify all URLs for accessibility and relevance before including them.
+- If no reliable sources are found, state this clearly and suggest alternative ways to find information.
+- Stay up-to-date with {current_time} for time-sensitive queries.
+- Structure responses with clear sections (e.g., "Key Facts," "Sources") for readability.
+- Never invent facts, sources, or details. If data is incomplete, acknowledge it.
+- Ensure all text has proper spacing between words and proper formatting.
+"""
+
+# URL Regex & Checker
+url_pattern = re.compile(r'https?://[\w\-./?=&%]+', re.IGNORECASE)
+
+async def check_url(url: str) -> str:
+    if url.lower().startswith("javascript:"):
+        return f"{url} (unsafe)"
+    try:
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
+            r = await client.get(url, headers={"User-Agent": "NOVA/1.0"})
+            return f"{url} (accessible)" if r.status_code == 200 else f"{url} (status {r.status_code})"
+    except Exception as e:
+        return f"{url} ({e.__class__.__name__})"
+
+def format_text_chunk(text: str) -> str:
+    """Format text chunks for proper display"""
+    if not text:
+        return ""
+    
+    # Fix common spacing issues
+    formatted = text
+    
+    # Add space after punctuation followed by capital letter
+    formatted = re.sub(r'([.!?])([A-Z])', r'\1 \2', formatted)
+    
+    # Add space between word and capital letter (like HelloWorld -> Hello World)
+    formatted = re.sub(r'([a-z])([A-Z])', r'\1 \2', formatted)
+    
+    # Fix emoji spacing
+    formatted = re.sub(r'([^\s])([👋🎯🔍📝✅❓🌐💡📗📌⚠️🚀📊🎨🔧💭🎪🏆📈🎭🔮🎸🎵🎬])', r'\1 \2', formatted)
+    formatted = re.sub(r'([👋🎯🔍📝✅❓🌐💡📗📌⚠️🚀📊🎨🔧💭🎪🏆📈🎭🔮🎸🎵🎬])([^\s])', r'\1 \2', formatted)
+    
+    # Add space between letters and numbers
+    formatted = re.sub(r'([a-zA-Z])(\d)', r'\1 \2', formatted)
+    formatted = re.sub(r'(\d)([a-zA-Z])', r'\1 \2', formatted)
+    
+    return formatted
+
+def format_final_response(text: str) -> str:
+    """Final formatting pass for the complete response"""
+    if not text:
+        return ""
+    
+    # Apply all formatting
+    formatted = format_text_chunk(text)
+    
+    # Remove URL annotations
+    formatted = re.sub(r'\s*\(status \d+\)|\(accessible\)|\(unsafe\)', '', formatted)
+    formatted = re.sub(r'(https?://[^\s<>"\']+)\s+', r'\1', formatted)
+    
+    # Clean up extra whitespace but preserve intentional line breaks
+    lines = formatted.split('\n')
+    cleaned_lines = []
+    for line in lines:
+        cleaned_line = ' '.join(line.split())  # Remove extra spaces within line
+        cleaned_lines.append(cleaned_line)
+    
+    formatted = '\n'.join(cleaned_lines)
+    
+    return formatted.strip()
+
+# Chat Endpoint with Memory
+@app.post("/chat")
+async def chat_stream(request: ChatRequest) -> StreamingResponse:
+    current_time = datetime.now().strftime("%B %d, %Y, %I:%M %p %Z")
+    session_id = request.session_id or f"sess_{int(datetime.now().timestamp())}_{os.urandom(4).hex()}"
+
+    history = load_conversation(session_id)
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        try:
+            accumulated_response = ""
+            messages = [
+                {"role": "system", "content": CHAT_SYSTEM_PROMPT.format(current_time=current_time)}
+            ] + history + [
+                {"role": "user", "content": request.message}
+            ]
+
+            stream = client.chat.completions.create(
+                model="ai/gemma3",
+                messages=messages,
+                stream=True,
+                temperature=0.7,
+                max_tokens=2048
+            )
+
+            for chunk in stream:
+                if chunk.choices[0].delta.content:
+                    content = chunk.choices[0].delta.content
+                    accumulated_response += content
+                    
+                    # Format the chunk for better display
+                    formatted_chunk = format_text_chunk(content)
+                    
+                    # Send formatted chunk
+                    yield f"data: {formatted_chunk}\n\n"
+
+            # Final formatting
+            final_response = format_final_response(accumulated_response)
+
+            # Check URLs
+            urls = url_pattern.findall(final_response)
+            if urls:
+                yield f"data: \n\n🔗 Links found:\n"
+                for url in urls:
+                    yield f"data: {await check_url(url)}\n"
+
+            save_message(session_id, "user", request.message)
+            save_message(session_id, "assistant", final_response)
+
+            yield f"data: \n\n✅ Continue this chat with session ID: `{session_id}`\n\n"
+
+        except Exception as e:
+            error_msg = f"Error: {str(e)}"
+            logger.error(f"Stream error: {error_msg}")
+            yield f"data: {error_msg}\n\n"
+            save_message(session_id, "assistant", f"[System error: {str(e)}]")
+
+    return StreamingResponse(
+        event_generator(), 
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
+
+# Web Search with Memory
+@app.post("/web_search")
+async def web_search(request: ChatRequest) -> StreamingResponse:
+    current_time = datetime.now().strftime("%B %d, %Y, %I:%M %p %Z")
+    query = request.message
+    session_id = request.session_id or f"sess_{int(datetime.now().timestamp())}_{os.urandom(4).hex()}"
+
+    history = load_conversation(session_id)
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        try:
+            summary_prompt = WEB_SEARCH_SYSTEM_PROMPT.format(current_time=current_time) + "\n\nAnalyze and summarize the following sources:\n\n"
+            all_urls = []
+
+            try:
+                dd_results = DDGS().text(query, max_results=5)
+                if dd_results:
+                    summary_prompt += "=== Web Results (DuckDuckGo) ===\n"
+                    for i, r in enumerate(dd_results, 1):
+                        summary_prompt += f"{i}. [{r['title']}]({r['href']})\n   {r['body']}\n\n"
+                        all_urls.append(r['href'])
+            except Exception as e:
+                summary_prompt += f"⚠️ Could not fetch web results: {str(e)}\n\n"
+
+            try:
+                wiki_page = wiki.page(query)
+                if wiki_page.exists():
+                    summary_prompt += f"=== Wikipedia Entry: {wiki_page.title} ===\n{wiki_page.summary[:1200]}{'...' if len(wiki_page.summary) > 1200 else ''}\n\n"
+                    all_urls.append(wiki_page.fullurl)
+                else:
+                    summary_prompt += f"⚠️ No Wikipedia page found for '{query}'.\n\n"
+            except Exception as e:
+                summary_prompt += f"⚠️ Error fetching Wikipedia: {str(e)}\n\n"
+
+            if "⚠️ Could not fetch" in summary_prompt and "=== Wikipedia Entry" not in summary_prompt:
+                response = f"⚪ No reliable information found for *{query}* as of {current_time}. Try a different phrasing."
+                yield f"data: {response}\n\n"
+                save_message(session_id, "user", query)
+                save_message(session_id, "assistant", response)
+                yield f"data: \n\n📌 Tip: Be specific and use full terms (e.g., 'climate change effects on oceans').\n"
+                yield f"data: ✅ Use session ID: `{session_id}` to continue.\n\n"
+                return
+
+            context_messages = [
+                {"role": "system", "content": summary_prompt},
+                {"role": "user", "content": f"Summarize the key facts about: {query}"}
+            ] + history[-4:]
+
+            stream = client.chat.completions.create(
+                model="ai/gemma3",
+                messages=context_messages,
+                stream=True,
+                temperature=0.7,
+                max_tokens=2048
+            )
+
+            accumulated_response = ""
+            
+            for chunk in stream:
+                if chunk.choices[0].delta.content:
+                    content = chunk.choices[0].delta.content
+                    accumulated_response += content
+                    
+                    # Format the chunk for better display
+                    formatted_chunk = format_text_chunk(content)
+                    
+                    # Send formatted chunk
+                    yield f"data: {formatted_chunk}\n\n"
+
+            # Final formatting
+            final_response = format_final_response(accumulated_response)
+
+            if all_urls:
+                yield f"data: \n\n🔗 Verified Sources:\n"
+                for url in all_urls:
+                    yield f"data: {await check_url(url)}\n"
+
+            yield f"data: \n\n💡 You can ask follow-up questions to go deeper!\n"
+            yield f"data: ✅ Continue with session ID: `{session_id}`\n\n"
+
+            save_message(session_id, "user", query)
+            save_message(session_id, "assistant", final_response)
+
+        except Exception as e:
+            error_msg = f"Search failed: {str(e)}"
+            logger.error(f"Search error: {error_msg}")
+            yield f"data: {error_msg}\n\n"
+            save_message(session_id, "user", query)
+            save_message(session_id, "assistant", f"[Error: {str(e)}]")
+
+    return StreamingResponse(
+        event_generator(), 
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
+
+# Session Management Endpoints
+@app.get("/sessions")
+async def list_sessions():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT session_id FROM conversations ORDER BY timestamp")
+        sessions = [row["session_id"] for row in cur.fetchall()]
+    return {"sessions": sessions}
+
+@app.get("/sessions/{session_id}")
+async def get_session(session_id: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT role, content, timestamp FROM conversations WHERE session_id = ? ORDER BY timestamp",
+            (session_id,)
+        )
+        rows = cur.fetchall()
+        if not rows:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return {
+            "session_id": session_id,
+            "messages": [{"role": r["role"], "content": r["content"], "time": r["timestamp"]} for r in rows]
+        }
+
+@app.delete("/sessions/{session_id}")
+async def delete_session(session_id: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM conversations WHERE session_id = ?", (session_id,))
+        count = cur.fetchone()[0]
+        if count == 0:
+            raise HTTPException(status_code=404, detail="Session not found")
+        cur.execute("DELETE FROM conversations WHERE session_id = ?", (session_id,))
+        conn.commit()
+    return {"message": f"Session {session_id} deleted successfully"}
+
+# Health Check
+@app.get("/")
+async def root():
+    return {"message": "NOVA Assistant is running", "endpoints": ["/chat", "/web_search", "/sessions"]}
+
+
+
+
+
+
+
+
+
+
+
+
+
+/////////////////////////////////////////// gives response in new lines in terminal /////////////////////
+import re
+import httpx
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from openai import OpenAI
+from duckduckgo_search import DDGS
+from datetime import datetime
+from typing import AsyncGenerator
+import wikipediaapi
+import sqlite3
+import os
+from fastapi.middleware.cors import CORSMiddleware
+import logging
+import json
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+# CORS Middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Database Setup
+DB_PATH = "data.db"
+
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS conversations (
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+
+init_db()
+
+def load_conversation(session_id: str) -> list[dict]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT role, content FROM conversations
+            WHERE session_id = ?
+            ORDER BY timestamp
+        """, (session_id,))
+        return [{"role": row["role"], "content": row["content"]} for row in cursor.fetchall()]
+
+def save_message(session_id: str, role: str, content: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO conversations (session_id, role, content) VALUES (?, ?, ?)",
+            (session_id, role, content)
+        )
+        conn.commit()
+
+# Models
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=1000)
+    session_id: str = None
+
+# OpenAI Client to Local LLM
+client = OpenAI(
+    base_url="http://model-runner.docker.internal/engines/llama.cpp/v1",
+    api_key="not-needed"
+)
+
+# Wikipedia API Client
+wiki = wikipediaapi.Wikipedia(
+    language='en',
+    extract_format=wikipediaapi.ExtractFormat.WIKI,
+    user_agent="NOVA/1.0 (jayanthkopparthi595@gmail.com)"
+)
+
+# Assistant Persona
+CHAT_SYSTEM_PROMPT = """You are NOVA, a highly accurate, empathetic, and user-friendly personal assistant. just with all the features you can provide"""
+
+WEB_SEARCH_SYSTEM_PROMPT = """You are NOVA, an expert research assistant focused on delivering accurate and reliable information.
+- Summarize information from provided sources (e.g., web results, Wikipedia) into a concise, coherent response.
+- Prioritize credible sources, citing them clearly (e.g., "Wikipedia states..." or "A web source from [site] reports...").
+- Include key facts, dates, definitions, or notable controversies, avoiding unnecessary details.
+- If sources conflict, highlight discrepancies and provide a balanced summary.
+- Verify all URLs for accessibility and relevance before including them.
+- If no reliable sources are found, state this clearly and suggest alternative ways to find information.
+- Stay up-to-date with {current_time} for time-sensitive queries.
+- Structure responses with clear sections (e.g., "Key Facts," "Sources") for readability.
+- Never invent facts, sources, or details. If data is incomplete, acknowledge it.
+- Ensure all text has proper spacing between words and proper formatting.
+"""
+
+# URL Regex & Checker
+url_pattern = re.compile(r'https?://[\w\-./?=&%]+', re.IGNORECASE)
+
+async def check_url(url: str) -> str:
+    if url.lower().startswith("javascript:"):
+        return f"{url} (unsafe)"
+    try:
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
+            r = await client.get(url, headers={"User-Agent": "NOVA/1.0"})
+            return f"{url} (accessible)" if r.status_code == 200 else f"{url} (status {r.status_code})"
+    except Exception as e:
+        return f"{url} ({e.__class__.__name__})"
+
+def format_sse_data(content: str) -> str:
+    """Format content for Server-Sent Events, handling newlines properly"""
+    if not content:
+        return ""
+    
+    # Split content by lines and format each line for SSE
+    lines = content.split('\n')
+    formatted_lines = []
+    
+    for line in lines:
+        # Escape any existing 'data: ' prefixes in the content
+        escaped_line = line.replace('data: ', 'data\\: ')
+        formatted_lines.append(f"data: {escaped_line}")
+    
+    # Join with \n\n to separate each data line in SSE format
+    return '\n'.join(formatted_lines) + '\n\n'
+
+def send_chunk_properly(content: str) -> str:
+    """Send a chunk with proper SSE formatting and newline handling"""
+    if not content.strip():
+        return ""
+    
+    # For SSE, we need to handle multi-line content properly
+    lines = content.split('\n')
+    result = []
+    
+    for line in lines:
+        if line.strip():  # Only send non-empty lines
+            result.append(f"data: {line}")
+        else:
+            result.append("data: ")  # Empty data line for spacing
+    
+    return '\n'.join(result) + '\n\n'
+
+# Chat Endpoint with Memory
+@app.post("/chat")
+async def chat_stream(request: ChatRequest) -> StreamingResponse:
+    current_time = datetime.now().strftime("%B %d, %Y, %I:%M %p %Z")
+    session_id = request.session_id or f"sess_{int(datetime.now().timestamp())}_{os.urandom(4).hex()}"
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        try:
+            accumulated_response = ""
+            messages = [
+                {"role": "system", "content": CHAT_SYSTEM_PROMPT.format(current_time=current_time)}
+            ] + load_conversation(session_id) + [
+                {"role": "user", "content": request.message}
+            ]
+
+            stream = client.chat.completions.create(
+                model="ai/gemma3",
+                messages=messages,
+                stream=True,
+                temperature=0.7,
+                max_tokens=2048
+            )
+
+            word_buffer = ""
+            
+            for chunk in stream:
+                if chunk.choices[0].delta.content:
+                    content = chunk.choices[0].delta.content
+                    accumulated_response += content
+                    
+                    # Process content character by character to handle newlines
+                    for char in content:
+                        word_buffer += char
+                        
+                        # Send when we hit natural break points
+                        if char in [' ', '\n', '.', '!', '?', ';', ':', ','] and word_buffer.strip():
+                            # Handle newlines specially
+                            if '\n' in word_buffer:
+                                # Split by newlines and send each part
+                                parts = word_buffer.split('\n')
+                                for i, part in enumerate(parts):
+                                    if part.strip():
+                                        yield f"data: {part.strip()}\n\n"
+                                    if i < len(parts) - 1:  # Not the last part
+                                        yield "data: \n\n"  # Send empty line for newline
+                            else:
+                                yield f"data: {word_buffer}\n\n"
+                            
+                            word_buffer = ""
+            
+            # Send any remaining content
+            if word_buffer.strip():
+                if '\n' in word_buffer:
+                    parts = word_buffer.split('\n')
+                    for i, part in enumerate(parts):
+                        if part.strip():
+                            yield f"data: {part.strip()}\n\n"
+                        if i < len(parts) - 1:
+                            yield "data: \n\n"
+                else:
+                    yield f"data: {word_buffer}\n\n"
+
+            # Log the final accumulated response
+            logger.info(f"Final chat response for session {session_id}:\n{accumulated_response}")
+
+            # Check for URLs in the final response
+            urls = url_pattern.findall(accumulated_response)
+            if urls:
+                yield "data: \n\n"
+                yield "data: 🔗 Links found:\n\n"
+                for url in urls:
+                    yield f"data: {await check_url(url)}\n\n"
+
+            save_message(session_id, "user", request.message)
+            save_message(session_id, "assistant", accumulated_response)
+
+            yield "data: \n\n"
+            yield f"data: ✅ Continue this chat with session ID: `{session_id}`\n\n"
+
+        except Exception as e:
+            error_msg = f"Error: {str(e)}"
+            logger.error(f"Stream error: {error_msg}")
+            yield f"data: {error_msg}\n\n"
+            save_message(session_id, "assistant", f"[System error: {str(e)}]")
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+# Web Search with Memory
+@app.post("/web_search")
+async def web_search(request: ChatRequest) -> StreamingResponse:
+    current_time = datetime.now().strftime("%B %d, %Y, %I:%M %p %Z")
+    query = request.message
+    session_id = request.session_id or f"sess_{int(datetime.now().timestamp())}_{os.urandom(4).hex()}"
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        try:
+            summary_prompt = WEB_SEARCH_SYSTEM_PROMPT.format(current_time=current_time) + "\n\nAnalyze and summarize the following sources:\n\n"
+            all_urls = []
+
+            try:
+                dd_results = DDGS().text(query, max_results=5)
+                if dd_results:
+                    summary_prompt += "=== Web Results (DuckDuckGo) ===\n"
+                    for i, r in enumerate(dd_results, 1):
+                        summary_prompt += f"{i}. [{r['title']}]({r['href']})\n   {r['body']}\n\n"
+                        all_urls.append(r['href'])
+            except Exception as e:
+                summary_prompt += f"⚠️ Could not fetch web results: {str(e)}\n\n"
+
+            try:
+                wiki_page = wiki.page(query)
+                if wiki_page.exists():
+                    summary_prompt += f"=== Wikipedia Entry: {wiki_page.title} ===\n{wiki_page.summary[:1200]}{'...' if len(wiki_page.summary) > 1200 else ''}\n\n"
+                    all_urls.append(wiki_page.fullurl)
+                else:
+                    summary_prompt += f"⚠️ No Wikipedia page found for '{query}'.\n\n"
+            except Exception as e:
+                summary_prompt += f"⚠️ Error fetching Wikipedia: {str(e)}\n\n"
+
+            if "⚠️ Could not fetch" in summary_prompt and "=== Wikipedia Entry" not in summary_prompt:
+                response = f"⚪ No reliable information found for *{query}* as of {current_time}. Try a different phrasing."
+                yield f"data: {response}\n\n"
+                save_message(session_id, "user", query)
+                save_message(session_id, "assistant", response)
+                yield "data: \n\n"
+                yield "data: 📌 Tip: Be specific and use full terms (e.g., 'climate change effects on oceans').\n\n"
+                yield f"data: ✅ Use session ID: `{session_id}` to continue.\n\n"
+                # Log the final response when no sources are found
+                logger.info(f"Final web search response for session {session_id}:\n{response}")
+                return
+
+            context_messages = [
+                {"role": "system", "content": summary_prompt},
+                {"role": "user", "content": f"Summarize the key facts about: {query}"}
+            ] + load_conversation(session_id)[-4:]
+
+            stream = client.chat.completions.create(
+                model="ai/gemma3",
+                messages=context_messages,
+                stream=True,
+                temperature=0.7,
+                max_tokens=2048
+            )
+
+            accumulated_response = ""
+            word_buffer = ""
+            
+            for chunk in stream:
+                if chunk.choices[0].delta.content:
+                    content = chunk.choices[0].delta.content
+                    accumulated_response += content
+                    
+                    # Process content character by character to handle newlines
+                    for char in content:
+                        word_buffer += char
+                        
+                        # Send when we hit natural break points
+                        if char in [' ', '\n', '.', '!', '?', ';', ':', ','] and word_buffer.strip():
+                            # Handle newlines specially
+                            if '\n' in word_buffer:
+                                # Split by newlines and send each part
+                                parts = word_buffer.split('\n')
+                                for i, part in enumerate(parts):
+                                    if part.strip():
+                                        yield f"data: {part.strip()}\n\n"
+                                    if i < len(parts) - 1:  # Not the last part
+                                        yield "data: \n\n"  # Send empty line for newline
+                            else:
+                                yield f"data: {word_buffer}\n\n"
+                            
+                            word_buffer = ""
+            
+            # Send any remaining content
+            if word_buffer.strip():
+                if '\n' in word_buffer:
+                    parts = word_buffer.split('\n')
+                    for i, part in enumerate(parts):
+                        if part.strip():
+                            yield f"data: {part.strip()}\n\n"
+                        if i < len(parts) - 1:
+                            yield "data: \n\n"
+                else:
+                    yield f"data: {word_buffer}\n\n"
+
+            # Log the final accumulated response
+            logger.info(f"Final web search response for session {session_id}:\n{accumulated_response}")
+
+            if all_urls:
+                yield "data: \n\n"
+                yield "data: 🔗 Verified Sources:\n\n"
+                for url in all_urls:
+                    yield f"data: {await check_url(url)}\n\n"
+
+            yield "data: \n\n"
+            yield "data: 💡 You can ask follow-up questions to go deeper!\n\n"
+            yield f"data: ✅ Continue with session ID: `{session_id}`\n\n"
+
+            save_message(session_id, "user", query)
+            save_message(session_id, "assistant", accumulated_response)
+
+        except Exception as e:
+            error_msg = f"Search failed: {str(e)}"
+            logger.error(f"Search error: {error_msg}")
+            yield f"data: {error_msg}\n\n"
+            save_message(session_id, "user", query)
+            save_message(session_id, "assistant", f"[Error: {str(e)}]")
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+# Session Management Endpoints
+@app.get("/sessions")
+async def list_sessions():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT session_id FROM conversations ORDER BY timestamp")
+        sessions = [row["session_id"] for row in cur.fetchall()]
+    return {"sessions": sessions}
+
+@app.get("/sessions/{session_id}")
+async def get_session(session_id: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT role, content, timestamp FROM conversations WHERE session_id = ? ORDER BY timestamp",
+            (session_id,)
+        )
+        rows = cur.fetchall()
+        if not rows:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return {
+            "session_id": session_id,
+            "messages": [{"role": r["role"], "content": r["content"], "time": r["timestamp"]} for r in rows]
+        }
+
+@app.delete("/sessions/{session_id}")
+async def delete_session(session_id: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM conversations WHERE session_id = ?", (session_id,))
+        count = cur.fetchone()[0]
+        if count == 0:
+            raise HTTPException(status_code=404, detail="Session not found")
+        cur.execute("DELETE FROM conversations WHERE session_id = ?", (session_id,))
+        conn.commit()
+    return {"message": f"Session {session_id} deleted successfully"}
+
+# Health Check
+@app.get("/")
+async def root():
+    return {"message": "NOVA Assistant is running", "endpoints": ["/chat", "/web_search", "/sessions"]}

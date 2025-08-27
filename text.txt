@@ -1,0 +1,5 @@
+OPENROUTER_API_KEY = "no"
+LOCAL_MODEL_NAME = "ai/gemma3"
+REMOTE_MODEL_NAME = "ai/gemma3"
+LOCAL_BASE_URL = "http://model-runner.docker.internal/engines/llama.cpp/v1"
+REMOTE_BASE_URL = "http://model-runner.docker.internal/engines/llama.cpp/v1"

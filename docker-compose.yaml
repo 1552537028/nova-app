@@ -1,0 +1,16 @@
+services:
+  ai-app:
+    build: .
+    container_name: nova-ai
+    ports:
+      - "8000:8000"
+    depends_on:
+      - llm
+
+  llm:
+    image: cloud_app-ai-app:latest  
+    container_name: nova-llm
+    environment:
+      MODEL: ai/gemma3
+    ports:
+      - "8080:8080"

@@ -1,0 +1,104 @@
+/*Basic offline */
+//docker-compose.yml
+services:
+  ai-app:
+    build: .
+    depends_on:
+      - llm
+  llm:
+    provider:
+      type: model
+      options:
+        model: ai/gemma3
+// Dockerfile
+FROM python:3.9-slim
+
+RUN pip install langchain_openai
+
+COPY . .
+
+CMD ["python", "app.py"]
+
+//app.py
+from langchain_openai import ChatOpenAI
+
+# Initialize Small Local Model
+local_llm = ChatOpenAI(
+    model = "ai/gemma3",
+    base_url = "http://model-runner.docker.internal/engines/llama.cpp/v1"
+)
+
+response = local_llm.invoke(
+    "Hello, how are you?"
+)
+
+print("Local Model Response:", response)
+
+/* new working update (api) */
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from openai import OpenAI
+
+app = FastAPI()
+
+class ChatRequest(BaseModel):
+    message: str
+
+# Configure OpenAI client to talk to local LLM server
+client = OpenAI(
+    base_url="http://model-runner.docker.internal/engines/llama.cpp/v1",
+    api_key="not-needed"  # dummy since local model doesn't need it
+)
+
+# Assistant persona (system prompt)
+system_prompt = """You are a helpful and friendly personal assistant called NOVA.
+- Always answer politely.
+- Be concise but informative.
+- your responses should be relevant to the user's query. give more accurate and detailed information when necessary and ask user to provide more context or clarify their question.
+- If the user asks for tasks, provide step-by-step guidance.
+- Respond in a warm, conversational tone, in a way user loves to engage with. and encourage them to ask follow-up questions.
+- if the user asks basic questions, provide clear and simple explanations.
+- if the response output contains any web links, mention them explicitly. and check whether they are accessible. and check if they are safe."""
+
+
+@app.post("/chat")
+def chat_stream(request: ChatRequest):
+    def event_generator():
+        stream = client.chat.completions.create(
+            model="ai/gemma3",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": request.message},
+            ],
+            stream=True,
+        )
+        for chunk in stream:
+            content = chunk.choices[0].delta.content
+            if content:  # Only yield non-None content
+                yield content
+
+    return StreamingResponse(event_generator(), media_type="text/plain")
+
+FROM python:3.9-slim
+
+RUN pip install --no-cache-dir duckduckgo_search httpx fastapi uvicorn openai wikipedia-api
+
+COPY . .
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+
+
+services:
+  ai-app:
+    build: .
+    ports:
+      - "8000:8000"
+    depends_on:
+      - llm
+
+  llm:
+    provider:
+      type: model
+      options:
+        model: ai/gemma3
