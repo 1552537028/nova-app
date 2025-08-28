@@ -1,16 +1,29 @@
+version: "3.9"
+
 services:
   ai-app:
-    build: .
+    image: docker.io/jayanthkopparthi/cloud_app-ai-app:latest
     container_name: nova-ai
     ports:
-      - "https://nova-app-30ha.onrender.com"
+      - "8000:8000"
     depends_on:
       - llm
+    environment:
+      - OPENAI_API_KEY=not-needed   # not used for local LLM
+    networks:
+      - nova-net
 
   llm:
-    image: jayanthkopparthi/cloud_app-ai-app:latest
+    image: ghcr.io/ggerganov/llama.cpp:server  # llama.cpp server image
     container_name: nova-llm
-    environment:
-      MODEL: ai/gemma3
+    command: ["--model", "/models/gemma3.bin", "--host", "0.0.0.0", "--port", "8080"]
+    volumes:
+      - ./models:/models   # put your model weights in ./models
     ports:
-      - "https://nova-app-30ha.onrender.com"
+      - "8080:8080"
+    networks:
+      - nova-net
+
+networks:
+  nova-net:
+    driver: bridge
