@@ -3,7 +3,7 @@ FROM python:3.9-slim
 WORKDIR /app
 
 # Install dependencies
-RUN pip install --no-cache-dir duckduckgo_search httpx fastapi uvicorn openai wikipedia-api sqlite3
+RUN pip install --no-cache-dir duckduckgo_search httpx fastapi uvicorn openai wikipedia-api
 
 COPY . .
 
