@@ -73,7 +73,7 @@ class ChatRequest(BaseModel):
 
 # OpenAI Client to Local LLM
 client = OpenAI(
-    base_url="https://nova-docker-app.onrender.com",
+    base_url="http://llm:8080/v1",
     api_key="not-needed"
 )
 
