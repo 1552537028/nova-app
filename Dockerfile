@@ -1,6 +1,16 @@
 FROM python:3.9-slim
 
-RUN pip install duckduckgo_search httpx fastapi uvicorn openai wikipedia-api
+WORKDIR /app
+
+# Install dependencies
+RUN pip install --no-cache-dir \
+    duckduckgo_search \
+    httpx \
+    fastapi \
+    uvicorn \
+    openai \
+    wikipedia-api \
+    sqlite3
 
 COPY . .
 
