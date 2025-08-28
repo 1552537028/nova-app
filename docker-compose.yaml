@@ -3,7 +3,7 @@ services:
     build: .
     container_name: nova-ai
     ports:
-      - "8000:8000"
+      - "https://nova-app-30ha.onrender.com"
     depends_on:
       - llm
 
@@ -13,4 +13,4 @@ services:
     environment:
       MODEL: ai/gemma3
     ports:
-      - "8080:8080"
+      - "https://nova-app-30ha.onrender.com"
