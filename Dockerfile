@@ -1,11 +1,10 @@
-FROM ghcr.io/ggerganov/llama.cpp:server
+FROM python:3.9-slim
 
 WORKDIR /app
 
 # Install dependencies
 RUN pip install --no-cache-dir duckduckgo_search httpx fastapi uvicorn openai wikipedia-api
-# copy your Gemma model into the image
-COPY ./models/gemma3.gguf /models/gemma3.gguf
 
-CMD ["--model", "/models/gemma3.gguf", "--host", "0.0.0.0", "--port", "8080"]
+COPY . .
 
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
