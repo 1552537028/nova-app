@@ -1,12 +1,12 @@
 import re
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Path
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from openai import OpenAI
 from duckduckgo_search import DDGS
 from datetime import datetime
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 import wikipediaapi
 import sqlite3
 import os
@@ -39,6 +39,7 @@ def init_db():
                 session_id TEXT NOT NULL,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
+                is_web_search INTEGER DEFAULT 0,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -51,24 +52,24 @@ def load_conversation(session_id: str) -> list[dict]:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT role, content FROM conversations
+            SELECT role, content, is_web_search FROM conversations
             WHERE session_id = ?
             ORDER BY timestamp
         """, (session_id,))
-        return [{"role": row["role"], "content": row["content"]} for row in cursor.fetchall()]
+        return [{"role": row["role"], "content": row["content"], "is_web_search": bool(row["is_web_search"])} for row in cursor.fetchall()]
 
-def save_message(session_id: str, role: str, content: str):
+def save_message(session_id: str, role: str, content: str, is_web_search: int = 0):
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "INSERT INTO conversations (session_id, role, content) VALUES (?, ?, ?)",
-            (session_id, role, content)
+            "INSERT INTO conversations (session_id, role, content, is_web_search) VALUES (?, ?, ?, ?)",
+            (session_id, role, content, is_web_search)
         )
         conn.commit()
 
 # Models
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=2048)
-    session_id: str = None
+    session_id: Optional[str] = None
 
 # OpenAI Client to Local LLM
 client = OpenAI(
@@ -105,6 +106,7 @@ CHAT_SYSTEM_PROMPT = """You are NOVA, a knowledgeable assistant specializing in 
 - Never invent facts. If unsure, state: "I don't have enough information to answer fully."
 - Current time: {current_time}.
 """
+
 WEB_SEARCH_SYSTEM_PROMPT = """You are NOVA, an expert research assistant. Respond in markdown format with:
 - **Headings** (`##`, `###`) for main topics and subtopics.
 - **Key Facts** section with bullet points (`-`) or numbered lists (`1.`, `2.`).
@@ -137,105 +139,118 @@ async def check_url(url: str) -> str:
     except Exception as e:
         return f"{url} ({e.__class__.__name__})"
 
-def format_sse_data(content: str) -> str:
-    """Format content for Server-Sent Events, handling newlines properly"""
-    if not content:
-        return ""
-    lines = content.split('\n')
-    formatted_lines = []
-    for line in lines:
-        escaped_line = line.replace('data: ', 'data\\: ')
-        formatted_lines.append(f"data: {escaped_line}")
-    return '\n'.join(formatted_lines) + '\n\n'
+async def generate_chat_response(session_id: str, message: str, system_prompt: str, is_web_search: int = 0) -> AsyncGenerator[str, None]:
+    """Common chat response generator"""
+    try:
+        accumulated_response = ""
+        messages = [
+            {"role": "system", "content": system_prompt}
+        ] + load_conversation(session_id) + [
+            {"role": "user", "content": message}
+        ]
 
-def send_chunk_properly(content: str) -> str:
-    """Send a chunk with proper SSE formatting and newline handling"""
-    if not content.strip():
-        return ""
-    lines = content.split('\n')
-    result = []
-    for line in lines:
-        if line.strip():
-            result.append(f"data: {line}")
-        else:
-            result.append("data: ")
-    return '\n'.join(result) + '\n\n'
+        stream = client.chat.completions.create(
+            model="ai/gemma3",
+            messages=messages,
+            stream=True,
+            temperature=0.7,
+            max_tokens=2048
+        )
 
-# Chat Endpoint with Memory
-@app.post("/chat")
-async def chat_stream(request: ChatRequest) -> StreamingResponse:
-    current_time = datetime.now().strftime("%B %d, %Y, %I:%M %p %Z")
-    session_id = request.session_id or f"sess_{int(datetime.now().timestamp())}_{os.urandom(4).hex()}"
+        word_buffer = ""
+        
+        for chunk in stream:
+            if chunk.choices[0].delta.content:
+                content = chunk.choices[0].delta.content
+                accumulated_response += content
+                
+                for char in content:
+                    word_buffer += char
+                    if char in [' ', '\n', '.', '!', '?', ';', ':', ','] and word_buffer.strip():
+                        if '\n' in word_buffer:
+                            parts = word_buffer.split('\n')
+                            for i, part in enumerate(parts):
+                                if part.strip():
+                                    yield f"data: {part.strip()}\n\n"
+                                if i < len(parts) - 1:
+                                    yield "data: \n\n"
+                        else:
+                            yield f"data: {word_buffer}\n\n"
+                        word_buffer = ""
+        
+        if word_buffer.strip():
+            if '\n' in word_buffer:
+                parts = word_buffer.split('\n')
+                for i, part in enumerate(parts):
+                    if part.strip():
+                        yield f"data: {part.strip()}\n\n"
+                    if i < len(parts) - 1:
+                        yield "data: \n\n"
+            else:
+                yield f"data: {word_buffer}\n\n"
 
-    async def event_generator() -> AsyncGenerator[str, None]:
-        try:
-            accumulated_response = ""
-            messages = [
-                {"role": "system", "content": CHAT_SYSTEM_PROMPT.format(current_time=current_time)}
-            ] + load_conversation(session_id) + [
-                {"role": "user", "content": request.message}
-            ]
+        logger.info(f"Final chat response for session {session_id}:\n{accumulated_response}")
 
-            stream = client.chat.completions.create(
-                model="ai/gemma3",
-                messages=messages,
-                stream=True,
-                temperature=0.7,
-                max_tokens=2048
-            )
-
-            word_buffer = ""
-            
-            for chunk in stream:
-                if chunk.choices[0].delta.content:
-                    content = chunk.choices[0].delta.content
-                    accumulated_response += content
-                    
-                    for char in content:
-                        word_buffer += char
-                        if char in [' ', '\n', '.', '!', '?', ';', ':', ','] and word_buffer.strip():
-                            if '\n' in word_buffer:
-                                parts = word_buffer.split('\n')
-                                for i, part in enumerate(parts):
-                                    if part.strip():
-                                        yield f"data: {part.strip()}\n\n"
-                                    if i < len(parts) - 1:
-                                        yield "data: \n\n"
-                            else:
-                                yield f"data: {word_buffer}\n\n"
-                            word_buffer = ""
-            
-            if word_buffer.strip():
-                if '\n' in word_buffer:
-                    parts = word_buffer.split('\n')
-                    for i, part in enumerate(parts):
-                        if part.strip():
-                            yield f"data: {part.strip()}\n\n"
-                        if i < len(parts) - 1:
-                            yield "data: \n\n"
-                else:
-                    yield f"data: {word_buffer}\n\n"
-
-            logger.info(f"Final chat response for session {session_id}:\n{accumulated_response}")
-
-            urls = url_pattern.findall(accumulated_response)
-            if urls:
-                yield "data: \n\n"
-                yield "data: ## Sources\n\n"
-                for url in urls:
-                    yield f"data: - {await check_url(url)}\n\n"
-
-            save_message(session_id, "user", request.message)
-            save_message(session_id, "assistant", accumulated_response)
-
+        # Check for URLs and add sources
+        urls = url_pattern.findall(accumulated_response)
+        if urls:
             yield "data: \n\n"
-            yield f"data: **Continue this chat** with session ID: `{session_id}`\n\n"
+            yield "data: ## Sources\n\n"
+            for url in urls:
+                yield f"data: - {await check_url(url)}\n\n"
 
-        except Exception as e:
-            error_msg = f"## Error\n\n{str(e)}"
-            logger.error(f"Stream error: {error_msg}")
-            yield f"data: {error_msg}\n\n"
-            save_message(session_id, "assistant", f"[System error: {str(e)}]")
+        # Save conversation to database
+        save_message(session_id, "user", message, is_web_search)
+        save_message(session_id, "assistant", accumulated_response, is_web_search)
+
+        yield "data: \n\n"
+        yield f"data: **Session ID**: `{session_id}`\n\n"
+
+    except Exception as e:
+        error_msg = f"## Error\n\n{str(e)}"
+        logger.error(f"Stream error: {error_msg}")
+        yield f"data: {error_msg}\n\n"
+        save_message(session_id, "assistant", f"[System error: {str(e)}]", is_web_search)
+
+# Chat Endpoint - NEW CHAT (no session)
+@app.post("/chat")
+async def chat_new(request: ChatRequest) -> StreamingResponse:
+    """Start a new chat session"""
+    current_time = datetime.now().strftime("%B %d, %Y, %I:%M %p %Z")
+    # Generate new session ID
+    session_id = f"session_{int(datetime.now().timestamp())}_{os.urandom(4).hex()}"
+    
+    logger.info(f"Starting new chat session: {session_id}")
+    
+    system_prompt = CHAT_SYSTEM_PROMPT.format(current_time=current_time)
+    
+    async def event_generator() -> AsyncGenerator[str, None]:
+        async for chunk in generate_chat_response(session_id, request.message, system_prompt, 0):
+            yield chunk
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+# Chat Endpoint - EXISTING SESSION
+@app.post("/chat/{session_id}")
+async def chat_continue(
+    request: ChatRequest, 
+    session_id: str = Path(..., description="Session ID to continue conversation")
+) -> StreamingResponse:
+    """Continue an existing chat session"""
+    current_time = datetime.now().strftime("%B %d, %Y, %I:%M %p %Z")
+    
+    logger.info(f"Continuing chat session: {session_id}")
+    
+    # Check if session exists
+    existing_messages = load_conversation(session_id)
+    if not existing_messages:
+        logger.warning(f"Session {session_id} not found, but proceeding anyway")
+    
+    system_prompt = CHAT_SYSTEM_PROMPT.format(current_time=current_time)
+    
+    async def event_generator() -> AsyncGenerator[str, None]:
+        async for chunk in generate_chat_response(session_id, request.message, system_prompt, 0):
+            yield chunk
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -244,7 +259,7 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
 async def web_search(request: ChatRequest) -> StreamingResponse:
     current_time = datetime.now().strftime("%B %d, %Y, %I:%M %p %Z")
     query = request.message
-    session_id = request.session_id or f"sess_{int(datetime.now().timestamp())}_{os.urandom(4).hex()}"
+    session_id = request.session_id or f"search_{int(datetime.now().timestamp())}_{os.urandom(4).hex()}"
 
     async def event_generator() -> AsyncGenerator[str, None]:
         try:
@@ -274,10 +289,10 @@ async def web_search(request: ChatRequest) -> StreamingResponse:
             if "⚠️ Could not fetch" in summary_prompt and "## Wikipedia Entry" not in summary_prompt:
                 response = f"## No Results Found\n\nNo reliable information found for '{query}' as of {current_time}.\n\n**Tip**: Try rephrasing your query or using more specific terms."
                 yield f"data: {response}\n\n"
-                save_message(session_id, "user", query)
-                save_message(session_id, "assistant", response)
+                save_message(session_id, "user", query, 1)
+                save_message(session_id, "assistant", response, 1)
                 yield "data: \n\n"
-                yield f"data: **Continue** with session ID: `{session_id}`\n\n"
+                yield f"data: **Search Session ID**: `{session_id}`\n\n"
                 logger.info(f"Final web search response for session {session_id}:\n{response}")
                 return
 
@@ -337,17 +352,17 @@ async def web_search(request: ChatRequest) -> StreamingResponse:
 
             yield "data: \n\n"
             yield "data: **Follow-Up**: Ask more questions to dive deeper!\n\n"
-            yield f"data: **Continue** with session ID: `{session_id}`\n\n"
+            yield f"data: **Search Session ID**: `{session_id}`\n\n"
 
-            save_message(session_id, "user", query)
-            save_message(session_id, "assistant", accumulated_response)
+            save_message(session_id, "user", query, 1)
+            save_message(session_id, "assistant", accumulated_response, 1)
 
         except Exception as e:
             error_msg = f"## Error\n\nSearch failed: {str(e)}"
             logger.error(f"Search error: {error_msg}")
             yield f"data: {error_msg}\n\n"
-            save_message(session_id, "user", query)
-            save_message(session_id, "assistant", f"[Error: {str(e)}]")
+            save_message(session_id, "user", query, 1)
+            save_message(session_id, "assistant", f"[Error: {str(e)}]", 1)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -357,8 +372,28 @@ async def list_sessions():
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
-        cur.execute("SELECT DISTINCT session_id FROM conversations ORDER BY timestamp")
-        sessions = [row["session_id"] for row in cur.fetchall()]
+        cur.execute("""
+            SELECT DISTINCT session_id, MAX(timestamp) as last_message
+            FROM conversations 
+            GROUP BY session_id 
+            ORDER BY last_message DESC
+        """)
+        sessions = []
+        for row in cur.fetchall():
+            # Get first message for title
+            cur.execute("""
+                SELECT content FROM conversations 
+                WHERE session_id = ? AND role = 'user' 
+                ORDER BY timestamp LIMIT 1
+            """, (row["session_id"],))
+            first_msg = cur.fetchone()
+            title = first_msg["content"][:50] + "..." if first_msg and len(first_msg["content"]) > 50 else (first_msg["content"] if first_msg else "Untitled")
+            
+            sessions.append({
+                "session_id": row["session_id"],
+                "title": title,
+                "last_message": row["last_message"]
+            })
     return {"sessions": sessions}
 
 @app.get("/sessions/{session_id}")
@@ -367,7 +402,7 @@ async def get_session(session_id: str):
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute(
-            "SELECT role, content, timestamp FROM conversations WHERE session_id = ? ORDER BY timestamp",
+            "SELECT role, content, timestamp, is_web_search FROM conversations WHERE session_id = ? ORDER BY timestamp",
             (session_id,)
         )
         rows = cur.fetchall()
@@ -375,7 +410,7 @@ async def get_session(session_id: str):
             raise HTTPException(status_code=404, detail="Session not found")
         return {
             "session_id": session_id,
-            "messages": [{"role": r["role"], "content": r["content"], "time": r["timestamp"]} for r in rows]
+            "messages": [{"role": r["role"], "content": r["content"], "timestamp": r["timestamp"], "is_web_search": bool(r["is_web_search"])} for r in rows]
         }
 
 @app.delete("/sessions/{session_id}")
@@ -393,4 +428,18 @@ async def delete_session(session_id: str):
 # Health Check
 @app.get("/")
 async def root():
-    return {"message": "NOVA Assistant is running", "endpoints": ["/chat", "/web_search", "/sessions"]}
+    return {
+        "message": "NOVA Assistant is running", 
+        "endpoints": {
+            "chat": {
+                "new_chat": "POST /chat",
+                "continue_chat": "POST /chat/{session_id}"
+            },
+            "search": "POST /web_search",
+            "sessions": {
+                "list": "GET /sessions",
+                "get": "GET /sessions/{session_id}",
+                "delete": "DELETE /sessions/{session_id}"
+            }
+        }
+    }
