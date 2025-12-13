@@ -2,7 +2,8 @@ FROM python:3.9-slim
 
 WORKDIR /app
 
-# Install dependenciesRUN pip install --no-cache-dir \
+# Install dependencies
+RUN pip install --no-cache-dir \
     fastapi \
     "uvicorn[standard]" \
     duckduckgo_search \
